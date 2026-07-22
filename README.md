@@ -63,8 +63,8 @@
 | 号池统计 | 总量 / 可轮询 / 冷却 / 过期 / 封禁 **互斥分类**（`pool_status` 权威） |
 | Token 续期 | 后台 leader 维护；**维护间隔 / 提前刷新窗口可配置** |
 | 模型探测 | 单账号 / 多选批量 / 全量；**探测模型列表 / 间隔 / 自动踢出可配置** |
-| 协议注册 | MoeMail / YYDS / GPTMail / CF Temp Email / **TempMail.lol** + 内联过盾 / YesCaptcha；代理池；入池后延迟测活；**多邮箱 Key 独立槽位** |
-| SSO / JSON / CPA | 后台任务 + 实时进度；JSON 多文件导入；**一键推送 sub2api**；**一键同步 CLIProxyAPI auth 目录**；CPA/auth 文件双向格式兼容 |
+| 协议注册 | MoeMail / YYDS / GPTMail / CF Temp Email / **TempMail.lol** / Cloud Mail + 内联过盾 / YesCaptcha；注册代理贯穿 TempMail.lol 与本地过盾；入池后延迟测活；**多邮箱 Key 独立槽位** |
+| SSO / JSON / CPA | 后台任务 + 实时进度；JSON 多文件导入；**一键推送 sub2api（代理映射 / 分组自建 / 去重）**；**一键同步 CLIProxyAPI auth 目录**；CPA/auth 文件双向格式兼容 |
 | 任务日志 | 注册、SSO、JSON、测活、续期等结果落 PG |
 | 用量统计 | 代理侧 token / 请求：今日·近 N 天·累计；按 Key / 账号 / 模型；**首字 TTFT / 完成耗时 / 思考强度** |
 | 流式可靠性 | early SSE 信封；**假阳性 client_gone 不再丢中间 tool/text 帧**；错误/断开仍发终态帧 |
@@ -85,6 +85,23 @@
 | **TempMail.lol / 邮件槽位** | 继承 v2.0.3：独立 Key 槽位、防交叉污染 |
 
 继承 v2.0.x：CPA prompt cache · 同会话粘号 · 流式 tool 可靠性 · 用量 TTFT / 思考强度。
+
+---
+
+## `main` 功能更新（2026-07-22，待发布）
+
+> 以下能力已合入 `main`，适用于源码构建或 `edge` 镜像；固定版本 `2.0.4` 镜像不包含这些未发布变更。
+
+| 范围 | 更新行为 |
+|------|----------|
+| **协议注册启动** | 创建注册任务改用 60 秒长请求客户端，避免 Turnstile、邮箱或 device flow 尚未返回响应头时被 Go 网关提前判定超时 |
+| **注册代理闭环** | 任务选中的代理继续传给 TempMail.lol 创建/收信和本地 Turnstile 浏览器；代理上下文创建失败时不再静默回退直连 |
+| **Grok 推理代理** | Go 推理与模型健康探测优先读取 `GROK2API_XAI_PROXY` / `GROK2API_PROXY`，再按 Go 标准规则读取 `HTTPS_PROXY` / `HTTP_PROXY`；自定义代理格式无效时拒绝直连 |
+| **sub2api 代理与分组** | 注册账号保留所选代理；同步时按协议、主机、端口匹配 sub2api `proxy_id`；默认分组不存在时可自动创建，不再误用远端第一个分组 |
+| **sub2api 去重** | 按同名 Grok 账号执行 upsert，优先保留有效且到期时间更新的凭证，只补齐代理/分组元数据，并将其余可见重复记录设为 `inactive` |
+| **Docker 构建** | 浏览器、Python 依赖和系统包拆为可复用 `grokcli-2api-base:local`；日常代码构建不再重复下载固定国外资源 |
+
+注意：`invalid_grant` / `Refresh token has been revoked` 表示该 refresh token 已失效。同步去重可以阻止继续制造重复记录，但不能修复已吊销凭证，必须重新授权取得新 token。
 
 ---
 
@@ -259,6 +276,18 @@ echo "$GITHUB_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-s
 | `GROK2API_RELOAD` | 开发热更新：`1` 开启（强制单 worker）；生产保持 `0` |
 
 完整模板见 [`.env.example`](./.env.example)。**生产请修改默认数据库密码。**
+
+### xAI 出站代理
+
+国内或受限网络建议至少配置单一 xAI 代理：
+
+```env
+GROK2API_XAI_PROXY=http://proxy-host:7890
+```
+
+该变量用于 Grok 推理、模型健康探测、OIDC Token 续期及配额请求，必须是带协议的 URL。Go 推理客户端也兼容 `GROK2API_PROXY` 以及标准代理变量；由于 Grok 上游是 HTTPS，标准变量应配置 `HTTPS_PROXY`。项目专用变量优先，可避免给 PostgreSQL、Redis 和内部 sidecar 等非 xAI 流量设置全局代理。
+
+协议注册页面配置的代理池用于每个注册任务；其中 TempMail.lol 创建/轮询和本地 Turnstile 浏览器会使用任务代理。注册代理池支持 `http://host:port`、`socks5://user:pass@host:port` 和兼容格式 `host:port:user:pass`。
 
 ### 会话粘性（Prompt Cache）
 
@@ -474,6 +503,12 @@ Claude Code / Cursor / Cherry Studio：Base URL 填服务地址（通常带 `/v1
    - **导出 sub2api 数据**：下载官方 `type=sub2api-data` 备份 JSON（含 token），可在 sub2api「导入数据」直接上传
 4. 推送优先使用本地 access/refresh token 创建 `platform=grok` + `type=oauth` 账号；无 token 时回退 SSO→OAuth
 
+同步行为：
+- 分组按本次请求、已保存分组 ID、分组名称依次解析；开启自动创建后，缺失的默认分组会创建为 `grokcli-2api`
+- 代理优先使用账号保存的 `proxy` / `proxy_url`，否则按本地出站代理池稳定选择；sub2api 必须已有协议、主机、端口一致的代理记录
+- 同名 Grok 账号采用 upsert；远端已有更新凭证时不会被旧 token 覆盖，其余重复账号会设为 `inactive`
+- 已被 xAI 吊销的 refresh token 无法通过重试恢复，需要重新授权后再同步
+
 API：
 - `PUT /admin/api/settings/sub2api`
 - `POST /admin/api/settings/sub2api/test`
@@ -484,11 +519,12 @@ API：
 ### 协议注册
 
 依赖 **临时邮箱** + **过盾**（环境变量或管理台配置，存 PG）：
-- 邮箱：`MoeMail` / **YYDS Mail**（[vip.215.im](https://vip.215.im/docs)）/ **GPTMail**（[mail.chatgpt.org.uk](https://mail.chatgpt.org.uk/zh/api/)）
+- 邮箱：`MoeMail` / **YYDS Mail** / **GPTMail** / **CF Temp Email** / **TempMail.lol** / **Cloud Mail**
 - 过盾：本地内联 Turnstile Solver 或 YesCaptcha
 
 本地过盾默认与主容器同进程（`127.0.0.1:5072`），**无需填写 URL**；选 YesCaptcha 时仅用云端 Key。
 邮箱有效期：MoeMail 支持 1 小时 / 1 天 / 3 天 / 永久；YYDS / GPTMail 临时邮箱约 24 小时。
+邮箱服务必须能通过 HTTP API 创建地址并读取完整邮件正文，不支持直接填写普通 IMAP/SMTP 邮箱。xAI 验证码应在 120 秒内到达，正文需包含 `AAA-BBB` 或 6 位字母数字验证码；自建服务建议兼容 MoeMail 的 `/api/emails/generate`、`/api/emails/{id}` 和 `/api/emails/{id}/{message_id}` 接口。
 新注册账号入池后默认 **延迟 30s** 再自动测活；可在管理台「测活等待秒」调整，或用环境变量 `GROK2API_REG_PROBE_DELAY_SEC`（`0`=立即测活）。
 
 ---
