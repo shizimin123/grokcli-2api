@@ -90,6 +90,39 @@ func TestOpenUsesResponsesPathAndBridgesChatChunks(t *testing.T) {
 	}
 }
 
+func TestDefaultHTTPClientUsesGrokProxyEnvironment(t *testing.T) {
+	t.Setenv("GROK2API_XAI_PROXY", "http://10.0.0.10:7890")
+	t.Setenv("GROK2API_PROXY", "http://10.0.0.11:7890")
+
+	client := defaultHTTPClient()
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type=%T", client.Transport)
+	}
+	request, err := http.NewRequest(http.MethodPost, "https://cli-chat-proxy.grok.com/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL, err := transport.Proxy(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proxyURL == nil || proxyURL.String() != "http://10.0.0.10:7890" {
+		t.Fatalf("proxy=%v", proxyURL)
+	}
+}
+
+func TestProxyForRequestRejectsInvalidGrokProxy(t *testing.T) {
+	t.Setenv("GROK2API_XAI_PROXY", "10.0.0.10:7890")
+	request, err := http.NewRequest(http.MethodPost, "https://cli-chat-proxy.grok.com/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ProxyForRequest(request); err == nil || !strings.Contains(err.Error(), "GROK2API_XAI_PROXY") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func TestOpenUsesResponsesPathAndBridgesCompletedOutput(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/responses" {

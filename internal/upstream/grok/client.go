@@ -10,6 +10,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -55,7 +57,7 @@ func defaultHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout: 0,
 		Transport: &http.Transport{
-			Proxy:               http.ProxyFromEnvironment,
+			Proxy:               ProxyForRequest,
 			MaxIdleConns:        200,               // 增加全局空闲连接数
 			MaxIdleConnsPerHost: 100,               // 增加每个 host 的空闲连接数，支持高并发
 			MaxConnsPerHost:     200,               // 增加每个 host 的最大连接数
@@ -76,6 +78,23 @@ func defaultHTTPClient() *http.Client {
 			ReadBufferSize:        32 * 1024, // 增加读缓冲，提高大响应性能
 		},
 	}
+}
+
+// ProxyForRequest keeps Grok traffic aligned with the application's proxy
+// settings while retaining support for the standard Go proxy environment.
+func ProxyForRequest(request *http.Request) (*url.URL, error) {
+	for _, name := range []string{"GROK2API_XAI_PROXY", "GROK2API_PROXY"} {
+		raw := strings.TrimSpace(os.Getenv(name))
+		if raw == "" {
+			continue
+		}
+		proxyURL, err := url.Parse(raw)
+		if err != nil || proxyURL.Scheme == "" || proxyURL.Host == "" {
+			return nil, fmt.Errorf("invalid %s proxy URL", name)
+		}
+		return proxyURL, nil
+	}
+	return http.ProxyFromEnvironment(request)
 }
 
 func (c *Client) Open(ctx context.Context, account Account, model string, body map[string]any) (*http.Response, error) {

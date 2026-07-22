@@ -155,7 +155,7 @@ func newProbeHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout: defaultProbeTimeout,
 		Transport: &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
+			Proxy:                 grok.ProxyForRequest,
 			MaxIdleConns:          128,
 			MaxIdleConnsPerHost:   64,
 			MaxConnsPerHost:       96,
