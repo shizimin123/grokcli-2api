@@ -4496,6 +4496,31 @@ func sharedRegistrationHTTP() *http.Client {
 	return regHTTPClient
 }
 
+// sharedRegistrationHTTPLong returns an HTTP client with a generous timeout
+// for long-running POST operations (job creation, device login, SSO import)
+// that may take 30s+ due to turnstile solving and email roundtrips.
+var (
+	regHTTPLongClientOnce sync.Once
+	regHTTPLongClient     *http.Client
+)
+
+func sharedRegistrationHTTPLong() *http.Client {
+	regHTTPLongClientOnce.Do(func() {
+		regHTTPLongClient = &http.Client{
+			Timeout: 60 * time.Second,
+			Transport: &http.Transport{
+				DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+				MaxIdleConns:          128,
+				MaxIdleConnsPerHost:   64,
+				MaxConnsPerHost:       64,
+				IdleConnTimeout:       90 * time.Second,
+				ForceAttemptHTTP2:     true,
+			},
+		}
+	})
+	return regHTTPLongClient
+}
+
 func registrationClient(options Options) *regclient.Client {
 	base := strings.TrimSpace(options.RegistrationURL)
 	if base == "" {
@@ -4516,9 +4541,10 @@ func registrationClient(options Options) *regclient.Client {
 	regClientBase = base
 	regClientToken = token
 	regClientCache = &regclient.Client{
-		BaseURL: base,
-		Token:   token,
-		HTTP:    sharedRegistrationHTTP(),
+		BaseURL:  base,
+		Token:    token,
+		HTTP:     sharedRegistrationHTTP(),
+		HTTPLong: sharedRegistrationHTTPLong(),
 	}
 	return regClientCache
 }

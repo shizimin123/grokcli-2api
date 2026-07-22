@@ -59,6 +59,9 @@ WORKDIR /app
 # Static docker CLI for in-container hot-update (needs docker.sock mount at runtime).
 ARG DOCKER_CLI_VERSION=27.5.1
 ARG TARGETARCH
+# Build-time proxy (optional, for restricted networks). Set via --build-arg when needed.
+ARG BUILD_HTTP_PROXY=""
+ARG BUILD_HTTPS_PROXY=""
 RUN sed -i "s|deb.debian.org|mirrors.ustc.edu.cn|g" /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true && apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -98,7 +101,7 @@ RUN sed -i "s|deb.debian.org|mirrors.ustc.edu.cn|g" /etc/apt/sources.list.d/debi
          arm64|aarch64) darch=aarch64 ;; \
          *) darch=x86_64 ;; \
        esac \
-    && curl -fsSL -x http://10.0.0.10:7890 "https://download.docker.com/linux/static/stable/${darch}/docker-${DOCKER_CLI_VERSION}.tgz" \
+    && curl -fsSL "https://mirrors.aliyun.com/docker-ce/linux/static/stable/${darch}/docker-${DOCKER_CLI_VERSION}.tgz" \
          | tar -xz -C /tmp \
     && mv /tmp/docker/docker /usr/local/bin/docker \
     && chmod +x /usr/local/bin/docker \
@@ -109,14 +112,15 @@ RUN sed -i "s|deb.debian.org|mirrors.ustc.edu.cn|g" /etc/apt/sources.list.d/debi
 COPY requirements.txt /app/requirements.txt
 COPY requirements-store.txt /app/requirements-store.txt
 COPY turnstile-solver/requirements.txt /app/turnstile-solver-requirements.txt
-RUN python -m pip install --no-cache-dir --proxy http://10.0.0.10:7890 -U pip setuptools wheel \
-    && python -m pip install --no-cache-dir --proxy http://10.0.0.10:7890 -r /app/requirements.txt \
-    && python -m pip install --no-cache-dir --proxy http://10.0.0.10:7890 -r /app/requirements-store.txt \
-    && python -m pip install --no-cache-dir --proxy http://10.0.0.10:7890 -r /app/turnstile-solver-requirements.txt
+RUN python -m pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -U pip setuptools wheel \
+    && python -m pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r /app/requirements.txt \
+    && python -m pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r /app/requirements-store.txt \
+    && python -m pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r /app/turnstile-solver-requirements.txt
 
 # Prefetch browser binaries used by inline solver
-RUN http_proxy=http://10.0.0.10:7890 https_proxy=http://10.0.0.10:7890 python -m camoufox fetch \
-    && http_proxy=http://10.0.0.10:7890 https_proxy=http://10.0.0.10:7890 python -m patchright install chromium || true
+# Uses BUILD_HTTP_PROXY / BUILD_HTTPS_PROXY from build args if set.
+RUN http_proxy=${BUILD_HTTP_PROXY} https_proxy=${BUILD_HTTPS_PROXY} python -m camoufox fetch \
+    && http_proxy=${BUILD_HTTP_PROXY} https_proxy=${BUILD_HTTPS_PROXY} python -m patchright install chromium || true
 
 COPY . /app
 COPY --from=go-builder /out/grok2api /app/bin/grok2api
