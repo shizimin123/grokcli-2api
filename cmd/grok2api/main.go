@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -80,7 +81,17 @@ func main() {
 	}
 
 	if store != nil {
-		oidcClient := &oidc.Client{}
+		// 创建带代理的 HTTP 客户端，用于 OIDC token 续期（国内服务器需代理访问 auth.x.ai）
+		var httpClient *http.Client
+		if proxyURL := os.Getenv("GROK2API_XAI_PROXY"); proxyURL != "" {
+			if u, err := url.Parse(proxyURL); err == nil && u.Scheme != "" && u.Host != "" {
+				httpClient = &http.Client{
+					Transport: &http.Transport{Proxy: http.ProxyURL(u)},
+					Timeout:   30 * time.Second,
+				}
+			}
+		}
+		oidcClient := &oidc.Client{HTTP: httpClient}
 		maintSvc = maintainer.New(store, redisClient, oidcClient)
 		healthSvc = modelhealth.New(store, redisClient, cfg.UpstreamBase, []string{cfg.DefaultModel})
 		if leader != nil {
