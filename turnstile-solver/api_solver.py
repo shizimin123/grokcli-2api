@@ -974,7 +974,7 @@ class TurnstileAPIServer:
 
         return context_options
 
-    async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None):
+    async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None, task_proxy: Optional[str] = None):
         """Solve the Turnstile challenge.
 
         Single-task multi-round: on timeout / empty token, close context and
@@ -1037,8 +1037,8 @@ class TurnstileAPIServer:
                 if self.debug:
                     logger.warning(f"Browser {index}: Cannot check browser state: {str(e)}")
 
-            proxy = None
-            if self.proxy_support:
+            proxy = (task_proxy or "").strip() or None
+            if not proxy and self.proxy_support:
                 proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
                 try:
                     with open(proxy_file_path) as proxy_file:
@@ -1065,12 +1065,14 @@ class TurnstileAPIServer:
                             f"url={url} sitekey={sitekey[:12]}..."
                         )
 
-                    context_options = self._build_context_options(
-                        browser_config or {}, proxy if self.proxy_support else None
-                    )
+                    context_options = self._build_context_options(browser_config or {}, proxy)
                     try:
                         context = await browser.new_context(**context_options)
                     except Exception as ctx_err:
+                        if proxy:
+                            raise RuntimeError(
+                                "failed to create proxied browser context"
+                            ) from ctx_err
                         # Fallback for Camoufox protocol mismatches / stricter option sets.
                         if self.debug:
                             logger.warning(
@@ -1102,7 +1104,8 @@ class TurnstileAPIServer:
                     if self.debug:
                         logger.debug(
                             f"Browser {index}: Starting Turnstile solve for URL: {url} "
-                            f"with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}"
+                            f"with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | "
+                            f"Proxy: {'configured' if proxy else 'none'}"
                         )
 
                     await page.goto(url, wait_until='domcontentloaded', timeout=30000)
@@ -1362,6 +1365,7 @@ class TurnstileAPIServer:
         sitekey: str,
         action: Optional[str] = None,
         cdata: Optional[str] = None,
+        proxy: Optional[str] = None,
     ):
         """创建任务并异步求解，返回 (task_id, error_response)。"""
         if not url or not sitekey:
@@ -1389,6 +1393,7 @@ class TurnstileAPIServer:
                     sitekey=sitekey,
                     action=action,
                     cdata=cdata,
+                    task_proxy=proxy,
                 )
             )
             if self.debug:
@@ -1450,7 +1455,8 @@ class TurnstileAPIServer:
         action = request.args.get('action')
         cdata = request.args.get('cdata')
 
-        task_id, err = await self._enqueue_turnstile(url, sitekey, action, cdata)
+        proxy = request.args.get('proxy')
+        task_id, err = await self._enqueue_turnstile(url, sitekey, action, cdata, proxy)
         if err:
             return jsonify(err), 200
         return jsonify({"errorId": 0, "taskId": task_id}), 200
@@ -1506,6 +1512,7 @@ class TurnstileAPIServer:
         sitekey = task.get("websiteKey") or task.get("sitekey") or task.get("siteKey")
         action = task.get("action") or task.get("pageAction")
         cdata = task.get("cdata") or task.get("data")
+        proxy = (task.get("proxy") or "").strip() or None
 
         # CapSolver 风格 metadata
         metadata = task.get("metadata") or {}
@@ -1513,7 +1520,7 @@ class TurnstileAPIServer:
             action = action or metadata.get("action")
             cdata = cdata or metadata.get("cdata")
 
-        task_id, err = await self._enqueue_turnstile(url, sitekey, action, cdata)
+        task_id, err = await self._enqueue_turnstile(url, sitekey, action, cdata, proxy)
         if err:
             return jsonify(err), 200
         return jsonify({"errorId": 0, "taskId": task_id}), 200

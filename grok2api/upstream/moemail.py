@@ -442,6 +442,26 @@ def normalize_proxy_config(
 _normalize_proxy_config = normalize_proxy_config
 
 
+def _httpx_client(
+    *,
+    timeout: float,
+    proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
+    **kwargs: Any,
+) -> httpx.Client:
+    proxy_cfg = normalize_proxy_config(
+        proxy,
+        username=proxy_username,
+        password=proxy_password,
+    )
+    return httpx.Client(
+        timeout=timeout,
+        proxy=proxy_cfg["proxy"] if proxy_cfg else None,
+        **kwargs,
+    )
+
+
 def _extract_codes_and_links(text: str) -> dict[str, list[str]]:
     codes = sorted(set(re.findall(r"(?<!\d)\d{6,8}(?!\d)", text or "")))
     links = sorted(set(re.findall(r"https?://[^\s\"'<>)]+", text or "")))
@@ -1708,7 +1728,12 @@ def tempmail_create_mailbox(
         # Paid tiers (Plus / Ultra)
         headers["Authorization"] = f"Bearer {key}"
 
-    with httpx.Client(timeout=30.0) as client:
+    with _httpx_client(
+        timeout=30.0,
+        proxy=proxy,
+        proxy_username=proxy_username,
+        proxy_password=proxy_password,
+    ) as client:
         resp = client.post(f"{base}/v2/inbox/create", json=payload or {}, headers=headers)
         if resp.status_code >= 400 and dom and "Invalid domain" in (resp.text or ""):
             # Free tier: drop custom domain and retry random.
@@ -1743,6 +1768,9 @@ def tempmail_fetch_messages(
     *,
     api_key: str | None = None,
     base_url: str | None = None,
+    proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
     include_details: bool = True,
     address: str | None = None,
     token: str | None = None,
@@ -1762,7 +1790,12 @@ def tempmail_fetch_messages(
     if key:
         headers["Authorization"] = f"Bearer {key}"
 
-    with httpx.Client(timeout=30.0) as client:
+    with _httpx_client(
+        timeout=30.0,
+        proxy=proxy,
+        proxy_username=proxy_username,
+        proxy_password=proxy_password,
+    ) as client:
         resp = client.get(
             f"{base}/v2/inbox",
             headers=headers,
@@ -2321,6 +2354,9 @@ def fetch_messages(
     provider: str | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
+    proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
     include_details: bool = True,
     address: str | None = None,
     token: str | None = None,
@@ -2368,6 +2404,9 @@ def fetch_messages(
             email_id,
             api_key=api_key,
             base_url=base_url,
+            proxy=proxy,
+            proxy_username=proxy_username,
+            proxy_password=proxy_password,
             include_details=include_details,
             address=address,
             token=token,

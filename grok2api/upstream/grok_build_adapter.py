@@ -1320,6 +1320,9 @@ def _make_email_receiver(
     *,
     api_key: str | None = None,
     base_url: str | None = None,
+    proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
     prefix: str | None = None,
     domain: str | None = None,
     expiry_ms: int | None = None,
@@ -1367,13 +1370,15 @@ def _make_email_receiver(
     pre = secrets.token_hex(5).lower()
 
     mailbox = create_mailbox(
-
         provider=prov,
         name=pre,
         domain=dom or None,
         expiry_ms=expiry_ms if expiry_ms is not None else MOEMAIL_EXPIRY_MS,
         api_key=key,
         base_url=base,
+        proxy=proxy,
+        proxy_username=proxy_username,
+        proxy_password=proxy_password,
     )
     email_id = mailbox["id"]
     address = mailbox["email"]
@@ -1389,6 +1394,9 @@ def _make_email_receiver(
             *,
             provider: str,
             token: str = "",
+            proxy: str | None = None,
+            proxy_username: str | None = None,
+            proxy_password: str | None = None,
         ):
             self.email = email
             self.email_id = email_id
@@ -1412,6 +1420,9 @@ def _make_email_receiver(
             self.base_url = base_url or default_base
             self.provider = provider
             self.token = token
+            self.proxy = proxy
+            self.proxy_username = proxy_username
+            self.proxy_password = proxy_password
 
         def wait_for_code(
             self,
@@ -1457,6 +1468,9 @@ def _make_email_receiver(
                             provider=self.provider,
                             api_key=self.api_key,
                             base_url=self.base_url,
+                            proxy=self.proxy,
+                            proxy_username=self.proxy_username,
+                            proxy_password=self.proxy_password,
                             include_details=True,
                             address=self.email,
                             token=self.token or None,
@@ -1526,6 +1540,9 @@ def _make_email_receiver(
         base_url=base,
         provider=prov,
         token=token,
+        proxy=proxy,
+        proxy_username=proxy_username,
+        proxy_password=proxy_password,
     )
 
 
@@ -1644,6 +1661,7 @@ def _prepare_registration_session(
         email, receiver = _make_email_receiver(
             api_key=moemail_api_key,
             base_url=moemail_base_url,
+            proxy=proxy,
             prefix=prefix,
             domain=domain,
             expiry_ms=expiry_ms,
@@ -3036,6 +3054,8 @@ def _run_registration(
                 "premium": use_premium,
                 "fallback_non_premium": True,
             }
+            if provider == "local" and proxy:
+                kwargs["proxy"] = proxy
             if provider != "local":
                 return solver.solve_turnstile(**kwargs)
 
