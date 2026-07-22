@@ -95,6 +95,9 @@ func (o Options) applySettingsToRuntime(settings map[string]any) {
 	if o.RuntimeConfig != nil {
 		o.RuntimeConfig.ApplyStoreSettings(settings)
 	}
+	if o.Maintainer != nil {
+		o.Maintainer.ConfigureFromSettings(settings)
+	}
 	// Hot-apply model health knobs (interval/batch/workers) without restart.
 	if o.ModelHealth != nil && settings != nil {
 		var intervalSec float64
@@ -4509,12 +4512,12 @@ func sharedRegistrationHTTPLong() *http.Client {
 		regHTTPLongClient = &http.Client{
 			Timeout: 60 * time.Second,
 			Transport: &http.Transport{
-				DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
-				MaxIdleConns:          128,
-				MaxIdleConnsPerHost:   64,
-				MaxConnsPerHost:       64,
-				IdleConnTimeout:       90 * time.Second,
-				ForceAttemptHTTP2:     true,
+				DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+				MaxIdleConns:        128,
+				MaxIdleConnsPerHost: 64,
+				MaxConnsPerHost:     64,
+				IdleConnTimeout:     90 * time.Second,
+				ForceAttemptHTTP2:   true,
 			},
 		}
 	})

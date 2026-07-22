@@ -2,6 +2,8 @@ package maintainer
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"strconv"
@@ -16,15 +18,17 @@ import (
 )
 
 type Service struct {
-	Store    *postgres.Connector
-	Redis    *redis.Client
-	OIDC     *oidc.Client
-	Interval time.Duration
-	Batch    int
-	Workers  int
-	Skew     time.Duration
-	Enabled  func() bool
-	IsLeader func() bool
+	Store            *postgres.Connector
+	Redis            *redis.Client
+	OIDC             *oidc.Client
+	Interval         time.Duration
+	Batch            int
+	Workers          int
+	Skew             time.Duration
+	SSOImporter      SSOImportClient
+	SSORecoveryBatch int
+	Enabled          func() bool
+	IsLeader         func() bool
 
 	mu        sync.Mutex
 	started   bool
@@ -34,21 +38,60 @@ type Service struct {
 	forceNext bool
 }
 
+type SSOImportClient interface {
+	StartSSOImport(context.Context, map[string]any) (map[string]any, error)
+	SSOImportJob(context.Context, string) (map[string]any, error)
+}
+
 func New(store *postgres.Connector, redisClient *redis.Client, oidcClient *oidc.Client) *Service {
 	return &Service{
-		Store:    store,
-		Redis:    redisClient,
-		OIDC:     oidcClient,
-		Interval: envDurationSec("GROK2API_TOKEN_MAINTAIN_INTERVAL", 60*time.Second, 5*time.Second, 30*time.Minute),
-		Batch:    envInt("GROK2API_TOKEN_REFRESH_BATCH", 80, 1, 500),
-		Workers:  envInt("GROK2API_TOKEN_REFRESH_WORKERS", 8, 1, 32),
-		Skew:     envDurationSec("GROK2API_TOKEN_REFRESH_SKEW", 180*time.Second, 30*time.Second, 2*time.Hour),
-		Enabled:  func() bool { return true },
-		IsLeader: func() bool { return true },
-		stop:     make(chan struct{}),
-		runSoon:  make(chan struct{}, 1),
-		last:     map[string]any{"ok": true, "started": false},
+		Store:            store,
+		Redis:            redisClient,
+		OIDC:             oidcClient,
+		Interval:         envDurationSec("GROK2API_TOKEN_MAINTAIN_INTERVAL", 60*time.Second, 5*time.Second, 30*time.Minute),
+		Batch:            envInt("GROK2API_TOKEN_REFRESH_BATCH", 80, 1, 500),
+		Workers:          envInt("GROK2API_TOKEN_REFRESH_WORKERS", 8, 1, 32),
+		Skew:             envDurationSec("GROK2API_TOKEN_REFRESH_SKEW", time.Hour, 30*time.Second, 2*time.Hour),
+		SSORecoveryBatch: envInt("GROK2API_SSO_REAUTH_BATCH", 4, 1, 20),
+		Enabled:          func() bool { return true },
+		IsLeader:         func() bool { return true },
+		stop:             make(chan struct{}),
+		runSoon:          make(chan struct{}, 1),
+		last:             map[string]any{"ok": true, "started": false},
 	}
+}
+
+// Configure hot-applies durable maintainer settings. Zero values preserve the
+// current setting so callers can update one knob independently.
+func (s *Service) Configure(intervalSec, skewSec float64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if intervalSec > 0 {
+		s.Interval = clampDuration(time.Duration(intervalSec*float64(time.Second)), 30*time.Second, time.Hour)
+	}
+	if skewSec > 0 {
+		s.Skew = clampDuration(time.Duration(skewSec*float64(time.Second)), 30*time.Second, 2*time.Hour)
+	}
+	started := s.started
+	s.mu.Unlock()
+	if started {
+		s.RequestRunSoon(false)
+	}
+}
+
+func (s *Service) ConfigureFromSettings(settings map[string]any) {
+	if s == nil || settings == nil {
+		return
+	}
+	s.Configure(floatFromAny(settings["token_maintain_interval_sec"]), floatFromAny(settings["token_refresh_skew_sec"]))
+}
+
+func (s *Service) configSnapshot() (time.Duration, int, int, time.Duration, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Interval, s.Batch, s.Workers, s.Skew, s.SSORecoveryBatch
 }
 
 func (s *Service) Start() {
@@ -153,7 +196,8 @@ func (s *Service) loop() {
 			return
 		case <-timer.C:
 			s.maybeRun(false)
-			timer.Reset(s.Interval)
+			interval, _, _, _, _ := s.configSnapshot()
+			timer.Reset(interval)
 		case <-s.runSoon:
 			force := false
 			s.mu.Lock()
@@ -167,7 +211,8 @@ func (s *Service) loop() {
 				default:
 				}
 			}
-			timer.Reset(s.Interval)
+			interval, _, _, _, _ := s.configSnapshot()
+			timer.Reset(interval)
 		}
 	}
 }
@@ -217,7 +262,7 @@ func (s *Service) RunOnce(ctx context.Context, force bool) map[string]any {
 	if n, err := s.Store.ExpireDueCooldowns(ctx, 500); err == nil {
 		result["expired_cooldowns"] = n
 	}
-	batch := s.Batch
+	interval, batch, configuredWorkers, skew, ssoRecoveryBatch := s.configSnapshot()
 	if batch <= 0 {
 		batch = 80
 	}
@@ -236,17 +281,13 @@ func (s *Service) RunOnce(ctx context.Context, force bool) map[string]any {
 		return result
 	}
 	now := time.Now()
-	skew := s.Skew
 	if skew <= 0 {
-		skew = 2 * time.Minute
+		skew = time.Hour
 	}
 	candidates := make([]postgres.AccountRefreshRow, 0, batch)
 	for _, row := range rows {
 		rt := stringFrom(row.Payload, "refresh_token")
 		if rt == "" {
-			continue
-		}
-		if truthy(row.Payload["refresh_invalid"]) {
 			continue
 		}
 		if !force {
@@ -260,8 +301,26 @@ func (s *Service) RunOnce(ctx context.Context, force bool) map[string]any {
 			break
 		}
 	}
+	if len(candidates) < batch && ssoRecoveryBatch > 0 {
+		recoveryRows, recoveryErr := s.Store.ListSSORecoverableAccounts(ctx, ssoRecoveryBatch*10)
+		if recoveryErr != nil {
+			result["sso_recovery_error"] = recoveryErr.Error()
+		} else {
+			recoveryCount := 0
+			for _, row := range recoveryRows {
+				if ssoReauthCoolingDown(row.Payload, now) {
+					continue
+				}
+				candidates = append(candidates, row)
+				recoveryCount++
+				if len(candidates) >= batch || recoveryCount >= ssoRecoveryBatch {
+					break
+				}
+			}
+		}
+	}
 
-	workers := s.Workers
+	workers := configuredWorkers
 	if workers <= 0 {
 		workers = 8
 	}
@@ -280,6 +339,7 @@ func (s *Service) RunOnce(ctx context.Context, force bool) map[string]any {
 		errText         string
 		expiresAt       any
 		hasRefreshToken bool
+		ssoReauthorized bool
 	}
 	outCh := make(chan outcome, len(candidates))
 	jobs := make(chan postgres.AccountRefreshRow, workers*2)
@@ -296,6 +356,17 @@ func (s *Service) RunOnce(ctx context.Context, force bool) map[string]any {
 				outCh <- outcome{id: row.ID, ok: false, errText: "refresh cancelled"}
 				continue
 			}
+			if truthy(row.Payload["refresh_invalid"]) {
+				reauth, err := s.reauthorizeWithSSO(ctx, row)
+				if err == nil {
+					outCh <- outcome{id: reauth.ID, ok: true, expiresAt: reauth.ExpiresAt, hasRefreshToken: reauth.HasRefreshToken, ssoReauthorized: true}
+					continue
+				}
+				_ = s.Store.MarkSSOReauthFailed(ctx, row.ID, err.Error())
+				_ = s.Store.SaveRenewFailure(ctx, row.ID, "sso_fail", err.Error(), "token_maintainer", true)
+				outCh <- outcome{id: row.ID, ok: false, permanent: true, errText: err.Error()}
+				continue
+			}
 			tokenData, err := oidcClient.RefreshAccessToken(ctx, row.Payload)
 			if err != nil {
 				permanent := false
@@ -309,9 +380,18 @@ func (s *Service) RunOnce(ctx context.Context, force bool) map[string]any {
 				status := "fail"
 				if permanent {
 					status = "invalid"
+					if accounts.GetSSOValue(row.Payload) != "" {
+						reauth, reauthErr := s.reauthorizeWithSSO(ctx, row)
+						if reauthErr == nil {
+							outCh <- outcome{id: reauth.ID, ok: true, expiresAt: reauth.ExpiresAt, hasRefreshToken: reauth.HasRefreshToken, ssoReauthorized: true}
+							continue
+						}
+						errText += "; sso reauthorization failed: " + reauthErr.Error()
+						_ = s.Store.MarkSSOReauthFailed(ctx, row.ID, reauthErr.Error())
+					}
 					_ = s.Store.MarkRefreshInvalid(ctx, row.ID, errText)
 				}
-				_ = s.Store.SaveRenewStatus(ctx, row.ID, false, status, errText, "token_maintainer")
+				_ = s.Store.SaveRenewFailure(ctx, row.ID, status, errText, "token_maintainer", permanent)
 				deleted := false
 				if permanent && accounts.GetSSOValue(row.Payload) == "" {
 					if ok, _ := s.Store.DeleteAccount(ctx, row.ID); ok {
@@ -323,7 +403,7 @@ func (s *Service) RunOnce(ctx context.Context, force bool) map[string]any {
 			}
 			newID, entry, err := oidc.EntryFromTokenResponse(tokenData, row.Payload)
 			if err != nil {
-				_ = s.Store.SaveRenewStatus(ctx, row.ID, false, "parse_fail", err.Error(), "token_maintainer")
+				_ = s.Store.SaveRenewFailure(ctx, row.ID, "parse_fail", err.Error(), "token_maintainer", false)
 				outCh <- outcome{id: row.ID, ok: false, errText: err.Error()}
 				continue
 			}
@@ -373,6 +453,9 @@ func (s *Service) RunOnce(ctx context.Context, force bool) map[string]any {
 		if o.hasRefreshToken {
 			row["has_refresh_token"] = true
 		}
+		if o.ssoReauthorized {
+			row["sso_reauthorized"] = true
+		}
 		if o.ok {
 			refreshed++
 			results = append(results, row)
@@ -395,7 +478,7 @@ func (s *Service) RunOnce(ctx context.Context, force bool) map[string]any {
 	if rem, ok := s.computeMinRemainingSec(ctx); ok {
 		result["min_remaining_sec"] = rem
 	}
-	result["next_wait_sec"] = s.Interval.Seconds()
+	result["next_wait_sec"] = interval.Seconds()
 	result["elapsed_ms"] = time.Since(startedAt).Milliseconds()
 	result["adaptive"] = map[string]any{"batch": batch, "skew_sec": skew.Seconds(), "workers": workers}
 	result["refresh"] = map[string]any{
@@ -528,8 +611,10 @@ func (s *Service) RunForIDs(ctx context.Context, ids []string, force bool) map[s
 		errText         string
 		expiresAt       any
 		hasRefreshToken bool
+		ssoReauthorized bool
 	}
-	workers := s.Workers
+	_, _, configuredWorkers, skew, _ := s.configSnapshot()
+	workers := configuredWorkers
 	if workers <= 0 {
 		workers = 8
 	}
@@ -539,9 +624,8 @@ func (s *Service) RunForIDs(ctx context.Context, ids []string, force bool) map[s
 	if workers < 1 {
 		workers = 1
 	}
-	skew := s.Skew
 	if skew <= 0 {
-		skew = 2 * time.Minute
+		skew = time.Hour
 	}
 	outCh := make(chan rowOut, len(clean))
 	jobs := make(chan string, workers*2)
@@ -563,13 +647,20 @@ func (s *Service) RunForIDs(ctx context.Context, ids []string, force bool) map[s
 				outCh <- rowOut{id: id, ok: false, errText: "account payload unavailable"}
 				continue
 			}
+			if truthy(payload["refresh_invalid"]) {
+				reauth, err := s.reauthorizeWithSSO(ctx, *row)
+				if err == nil {
+					outCh <- rowOut{id: reauth.ID, ok: true, expiresAt: reauth.ExpiresAt, hasRefreshToken: reauth.HasRefreshToken, ssoReauthorized: true}
+					continue
+				}
+				_ = s.Store.MarkSSOReauthFailed(ctx, id, err.Error())
+				_ = s.Store.SaveRenewFailure(ctx, id, "sso_fail", err.Error(), "manual_renew", true)
+				outCh <- rowOut{id: id, ok: false, permanent: true, errText: err.Error()}
+				continue
+			}
 			rt := stringFrom(payload, "refresh_token")
 			if rt == "" {
 				outCh <- rowOut{id: id, ok: true, skipped: true, errText: "no refresh_token"}
-				continue
-			}
-			if truthy(payload["refresh_invalid"]) {
-				outCh <- rowOut{id: id, ok: false, permanent: true, errText: "refresh_token marked invalid"}
 				continue
 			}
 			if !force {
@@ -595,9 +686,18 @@ func (s *Service) RunForIDs(ctx context.Context, ids []string, force bool) map[s
 				status := "fail"
 				if permanent {
 					status = "invalid"
+					if accounts.GetSSOValue(payload) != "" {
+						reauth, reauthErr := s.reauthorizeWithSSO(ctx, *row)
+						if reauthErr == nil {
+							outCh <- rowOut{id: reauth.ID, ok: true, expiresAt: reauth.ExpiresAt, hasRefreshToken: reauth.HasRefreshToken, ssoReauthorized: true}
+							continue
+						}
+						errText += "; sso reauthorization failed: " + reauthErr.Error()
+						_ = s.Store.MarkSSOReauthFailed(ctx, id, reauthErr.Error())
+					}
 					_ = s.Store.MarkRefreshInvalid(ctx, id, errText)
 				}
-				_ = s.Store.SaveRenewStatus(ctx, id, false, status, errText, "manual_renew")
+				_ = s.Store.SaveRenewFailure(ctx, id, status, errText, "manual_renew", permanent)
 				deleted := false
 				if permanent && accounts.GetSSOValue(payload) == "" {
 					if ok, _ := s.Store.DeleteAccount(ctx, id); ok {
@@ -609,7 +709,7 @@ func (s *Service) RunForIDs(ctx context.Context, ids []string, force bool) map[s
 			}
 			newID, entry, err := oidc.EntryFromTokenResponse(tokenData, payload)
 			if err != nil {
-				_ = s.Store.SaveRenewStatus(ctx, id, false, "parse_fail", err.Error(), "manual_renew")
+				_ = s.Store.SaveRenewFailure(ctx, id, "parse_fail", err.Error(), "manual_renew", false)
 				outCh <- rowOut{id: id, ok: false, errText: err.Error()}
 				continue
 			}
@@ -651,6 +751,9 @@ func (s *Service) RunForIDs(ctx context.Context, ids []string, force bool) map[s
 		}
 		if o.hasRefreshToken {
 			row["has_refresh_token"] = true
+		}
+		if o.ssoReauthorized {
+			row["sso_reauthorized"] = true
 		}
 		if o.ok && !o.skipped {
 			refreshed++
@@ -717,6 +820,121 @@ func asRefresh(err error, target **oidc.RefreshError) bool {
 	return false
 }
 
+type ssoReauthResult struct {
+	ID              string
+	ExpiresAt       any
+	HasRefreshToken bool
+}
+
+func (s *Service) reauthorizeWithSSO(ctx context.Context, row postgres.AccountRefreshRow) (ssoReauthResult, error) {
+	if s.SSOImporter == nil {
+		return ssoReauthResult{}, errors.New("SSO reauthorization service is not configured")
+	}
+	sso := accounts.GetSSOValue(row.Payload)
+	if sso == "" {
+		return ssoReauthResult{}, errors.New("account has no SSO cookie")
+	}
+	line := sso
+	if email := strings.TrimSpace(row.Email); email != "" {
+		line = email + "----" + sso
+	}
+	started, err := s.SSOImporter.StartSSOImport(ctx, map[string]any{
+		"sso_cookies": []string{line},
+		"merge":       true,
+		"max_workers": 1,
+		"delay":       0,
+	})
+	if err != nil {
+		return ssoReauthResult{}, err
+	}
+	jobID := stringFrom(started, "job_id")
+	if jobID == "" {
+		return ssoReauthResult{}, errors.New("SSO reauthorization did not return a job_id")
+	}
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		job, err := s.SSOImporter.SSOImportJob(ctx, jobID)
+		if err != nil {
+			return ssoReauthResult{}, err
+		}
+		status := strings.ToLower(stringFrom(job, "status"))
+		switch status {
+		case "done":
+			if intFromAny(job["success"]) < 1 {
+				return ssoReauthResult{}, errors.New(firstNonEmpty(stringFrom(job, "error"), stringFrom(job, "message"), "SSO reauthorization failed"))
+			}
+			imported, _ := job["imported"].([]any)
+			if len(imported) == 0 {
+				return ssoReauthResult{}, errors.New("SSO reauthorization completed without an imported account")
+			}
+			info, _ := imported[0].(map[string]any)
+			newID := stringFrom(info, "id")
+			if newID == "" {
+				newID = row.ID
+			}
+			_ = s.Store.ClearRefreshInvalid(ctx, newID)
+			_, _ = s.Store.ClearAccountCooldown(ctx, newID)
+			_ = s.Store.SaveRenewStatus(ctx, newID, true, "sso_ok", "", "sso_reauth")
+			if newID != row.ID {
+				_, _ = s.Store.DeleteAccount(ctx, row.ID)
+			}
+			return ssoReauthResult{
+				ID:              newID,
+				ExpiresAt:       info["expires_at"],
+				HasRefreshToken: truthy(info["has_refresh_token"]),
+			}, nil
+		case "error", "failed", "cancelled", "canceled":
+			return ssoReauthResult{}, errors.New(firstNonEmpty(stringFrom(job, "error"), stringFrom(job, "message"), "SSO reauthorization failed"))
+		}
+		select {
+		case <-ctx.Done():
+			return ssoReauthResult{}, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func ssoReauthCoolingDown(payload map[string]any, now time.Time) bool {
+	last := floatFromAny(payload["sso_reauth_failed_at"])
+	return last > 0 && float64(now.Unix())-last < (15*time.Minute).Seconds()
+}
+
+func intFromAny(v any) int {
+	return int(floatFromAny(v))
+}
+
+func floatFromAny(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case float32:
+		return float64(n)
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	case json.Number:
+		f, _ := n.Float64()
+		return f
+	case string:
+		f, _ := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		return f
+	default:
+		return 0
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func stringFrom(m map[string]any, key string) string {
 	if m == nil {
 		return ""
@@ -781,6 +999,16 @@ func envDurationSec(name string, fallback, min, max time.Duration) time.Duration
 		return max
 	}
 	return d
+}
+
+func clampDuration(value, min, max time.Duration) time.Duration {
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
 }
 
 func envInt(name string, fallback, min, max int) int {

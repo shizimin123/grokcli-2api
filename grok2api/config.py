@@ -243,7 +243,7 @@ MAIL_PROVIDER = (
     os.getenv("GROK2API_MAIL_PROVIDER") or os.getenv("MAIL_PROVIDER") or "moemail"
 ).strip().lower() or "moemail"
 # Auto-refresh access tokens this many seconds before expiry
-TOKEN_REFRESH_SKEW = float(os.getenv("GROK2API_TOKEN_REFRESH_SKEW", "120"))
+TOKEN_REFRESH_SKEW = float(os.getenv("GROK2API_TOKEN_REFRESH_SKEW", "3600"))
 
 # Force stream upstream (most models only support streaming on this proxy)
 FORCE_UPSTREAM_STREAM = os.getenv("GROK2API_FORCE_STREAM", "1") not in (

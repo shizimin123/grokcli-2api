@@ -56,13 +56,13 @@ def _skew() -> float:
     try:
         from grok2api.config import TOKEN_REFRESH_SKEW
 
-        return max(30.0, float(TOKEN_REFRESH_SKEW or 120.0))
+        return max(30.0, float(TOKEN_REFRESH_SKEW or 3600.0))
     except Exception:
         pass
     try:
-        return float(os.getenv("GROK2API_TOKEN_REFRESH_SKEW", "120"))
+        return float(os.getenv("GROK2API_TOKEN_REFRESH_SKEW", "3600"))
     except ValueError:
-        return 120.0
+        return 3600.0
 
 
 def _startup_delay() -> float:

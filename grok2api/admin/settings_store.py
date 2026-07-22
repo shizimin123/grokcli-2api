@@ -1555,22 +1555,22 @@ def get_token_refresh_skew_sec() -> float:
         try:
             from grok2api.config import TOKEN_REFRESH_SKEW
 
-            return float(TOKEN_REFRESH_SKEW or 120.0)
+            return float(TOKEN_REFRESH_SKEW or 3600.0)
         except Exception:
-            return 120.0
+            return 3600.0
     try:
         v = float(raw)
     except (TypeError, ValueError):
-        v = 120.0
-    return max(30.0, min(1_800.0, v))
+        v = 3600.0
+    return max(30.0, min(7_200.0, v))
 
 
 def set_token_refresh_skew_sec(value: float | str) -> float:
     try:
         v = float(value)
     except (TypeError, ValueError) as e:
-        raise ValueError("token_refresh_skew_sec 必须是数字 30–1800") from e
-    v = max(30.0, min(1_800.0, v))
+        raise ValueError("token_refresh_skew_sec 必须是数字 30–7200") from e
+    v = max(30.0, min(7_200.0, v))
     _set_setting_value("token_refresh_skew_sec", v)
     try:
         import grok2api.config as _cfg

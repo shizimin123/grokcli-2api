@@ -21,6 +21,7 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/protocol/historycompact"
 	"github.com/hm2899/grokcli-2api/internal/protocol/toolcall"
 	"github.com/hm2899/grokcli-2api/internal/quota"
+	regclient "github.com/hm2899/grokcli-2api/internal/registration/client"
 	appruntime "github.com/hm2899/grokcli-2api/internal/runtime"
 	"github.com/hm2899/grokcli-2api/internal/server"
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
@@ -93,6 +94,14 @@ func main() {
 		}
 		oidcClient := &oidc.Client{HTTP: httpClient}
 		maintSvc = maintainer.New(store, redisClient, oidcClient)
+		if cfg.RegistrationServiceURL != "" {
+			maintSvc.SSOImporter = &regclient.Client{
+				BaseURL:  cfg.RegistrationServiceURL,
+				Token:    cfg.RegistrationToken,
+				HTTP:     &http.Client{Timeout: 10 * time.Second},
+				HTTPLong: &http.Client{Timeout: 60 * time.Second},
+			}
+		}
 		healthSvc = modelhealth.New(store, redisClient, cfg.UpstreamBase, []string{cfg.DefaultModel})
 		if leader != nil {
 			maintSvc.IsLeader = leader.IsLeader
@@ -146,6 +155,9 @@ func main() {
 	if store != nil {
 		if settings, err := store.PublicSettings(context.Background()); err == nil {
 			runtimeCfg.ApplyStoreSettings(settings)
+			if maintSvc != nil {
+				maintSvc.ConfigureFromSettings(settings)
+			}
 			// Hot knobs for model health (interval/batch/workers) from durable settings.
 			if healthSvc != nil {
 				var intervalSec float64

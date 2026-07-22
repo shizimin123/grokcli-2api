@@ -1636,12 +1636,56 @@ func (c *Connector) ListRefreshableAccounts(ctx context.Context, limit int) ([]A
 			return nil, err
 		}
 		payload := decodeMap(payloadBytes)
-		// Skip permanently invalid refresh tokens even if SQL filter missed variants.
 		if truthyAny(payload["refresh_invalid"]) {
 			continue
 		}
 		if strings.TrimSpace(stringFromMap(payload, "refresh_token")) == "" {
 			// Near-expiry without RT is not refreshable.
+			continue
+		}
+		row := AccountRefreshRow{ID: id, Payload: payload}
+		if email != nil {
+			row.Email = *email
+		} else {
+			row.Email = stringFromMap(payload, "email")
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// ListSSORecoverableAccounts returns a small recovery queue for accounts whose
+// refresh token is permanently invalid but whose durable SSO cookie can mint a
+// fresh OAuth grant.
+func (c *Connector) ListSSORecoverableAccounts(ctx context.Context, limit int) ([]AccountRefreshRow, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	rows, err := c.Pool.Query(ctx, `
+		SELECT a.id, a.email, a.payload
+		FROM accounts a
+		WHERE COALESCE(a.payload->>'refresh_invalid', 'false') IN ('true', '1', 'yes')
+		  AND (a.expires_at IS NULL OR a.expires_at <= now() + interval '2 hours')
+		ORDER BY a.updated_at ASC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]AccountRefreshRow, 0, limit)
+	for rows.Next() {
+		var id string
+		var email *string
+		var payloadBytes []byte
+		if err := rows.Scan(&id, &email, &payloadBytes); err != nil {
+			return nil, err
+		}
+		payload := decodeMap(payloadBytes)
+		if accounts.GetSSOValue(payload) == "" {
 			continue
 		}
 		row := AccountRefreshRow{ID: id, Payload: payload}
@@ -1982,6 +2026,44 @@ func (c *Connector) MarkRefreshInvalid(ctx context.Context, accountID, reason st
 		updated_at = now()
 		WHERE id = $1
 	`, accountID, reason)
+	return err
+}
+
+// MarkSSOReauthFailed records a retry timestamp so automatic recovery does not
+// repeatedly submit the same bad SSO cookie every maintainer cycle.
+func (c *Connector) MarkSSOReauthFailed(ctx context.Context, accountID, reason string) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil
+	}
+	if len(reason) > 300 {
+		reason = reason[:300]
+	}
+	_, err := c.Pool.Exec(ctx, `
+		UPDATE accounts
+		SET payload = COALESCE(payload, '{}'::jsonb) || jsonb_build_object(
+			'sso_reauth_failed_at', extract(epoch from now()),
+			'sso_reauth_error', $2::text
+		), updated_at = now()
+		WHERE id = $1
+	`, accountID, reason)
+	return err
+}
+
+// ClearRefreshInvalid removes RT/SSO failure markers after SSO reauthorization.
+func (c *Connector) ClearRefreshInvalid(ctx context.Context, accountID string) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil
+	}
+	_, err := c.Pool.Exec(ctx, `
+		UPDATE accounts
+		SET payload = COALESCE(payload, '{}'::jsonb)
+			- 'refresh_invalid' - 'refresh_invalid_reason' - 'refresh_invalid_at'
+			- 'sso_reauth_failed_at' - 'sso_reauth_error',
+			updated_at = now()
+		WHERE id = $1
+	`, accountID)
 	return err
 }
 
@@ -2677,6 +2759,30 @@ func (c *Connector) SaveRenewStatus(ctx context.Context, accountID string, ok bo
 		`, accountID, status, source, float64(nowUnix))
 		return err
 	}
+	return c.SaveRenewFailure(ctx, accountID, status, errText, source, true)
+}
+
+// SaveRenewFailure records a failed attempt. Non-terminal failures keep the
+// account in rotation until the token is actually expired or two consecutive
+// attempts have failed; permanent OAuth/SSO failures expire it immediately.
+func (c *Connector) SaveRenewFailure(ctx context.Context, accountID, status, errText, source string, terminal bool) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil
+	}
+	status = strings.TrimSpace(status)
+	if status == "" {
+		status = "fail"
+	}
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "token_maintainer"
+	}
+	errText = strings.TrimSpace(errText)
+	if len(errText) > 300 {
+		errText = errText[:300]
+	}
+	nowUnix := time.Now().Unix()
 	_, err := c.Pool.Exec(ctx, `
 		INSERT INTO account_pool (account_id, extra, last_error, pool_status, updated_at)
 		VALUES (
@@ -2686,12 +2792,14 @@ func (c *Connector) SaveRenewStatus(ctx context.Context, accountID string, ok bo
 				'last_renew_source', $3::text,
 				'last_renew_error', $4::text,
 				'last_renew_fail_at', $5::float8,
-				'renew_fail_count', 1,
-				'token_expired_at', $5::float8,
-				'token_expired_reason', $4::text
-			),
+				'renew_fail_count', 1
+			) || CASE WHEN $6::boolean OR EXISTS (
+				SELECT 1 FROM accounts a WHERE a.id = $1 AND a.expires_at IS NOT NULL AND a.expires_at <= now()
+			) THEN jsonb_build_object('token_expired_at', $5::float8, 'token_expired_reason', $4::text) ELSE '{}'::jsonb END,
 			$4,
-			'expired',
+			CASE WHEN $6::boolean OR EXISTS (
+				SELECT 1 FROM accounts a WHERE a.id = $1 AND a.expires_at IS NOT NULL AND a.expires_at <= now()
+			) THEN 'expired' ELSE 'normal' END,
 			now()
 		)
 		ON CONFLICT (account_id) DO UPDATE SET
@@ -2700,18 +2808,26 @@ func (c *Connector) SaveRenewStatus(ctx context.Context, accountID string, ok bo
 				'last_renew_source', $3::text,
 				'last_renew_error', $4::text,
 				'last_renew_fail_at', $5::float8,
-				'renew_fail_count', COALESCE((account_pool.extra->>'renew_fail_count')::int, 0) + 1,
+				'renew_fail_count', COALESCE((account_pool.extra->>'renew_fail_count')::int, 0) + 1
+			) || CASE WHEN $6::boolean
+				OR COALESCE((account_pool.extra->>'renew_fail_count')::int, 0) + 1 >= 2
+				OR EXISTS (SELECT 1 FROM accounts a WHERE a.id = $1 AND a.expires_at IS NOT NULL AND a.expires_at <= now())
+			THEN jsonb_build_object(
 				'token_expired_at', COALESCE((account_pool.extra->>'token_expired_at')::float8, $5::float8),
 				'token_expired_reason', $4::text
-			),
+			) ELSE '{}'::jsonb END,
 			last_error = COALESCE(NULLIF($4, ''), account_pool.last_error),
 			pool_status = CASE
 				WHEN account_pool.disabled_for_quota = true THEN 'quota_disabled'
 				WHEN account_pool.enabled = false THEN 'disabled'
-				ELSE 'expired'
+				WHEN $6::boolean
+					OR COALESCE((account_pool.extra->>'renew_fail_count')::int, 0) + 1 >= 2
+					OR EXISTS (SELECT 1 FROM accounts a WHERE a.id = $1 AND a.expires_at IS NOT NULL AND a.expires_at <= now())
+				THEN 'expired'
+				ELSE account_pool.pool_status
 			END,
 			updated_at = now()
-	`, accountID, status, source, errText, float64(nowUnix))
+	`, accountID, status, source, errText, float64(nowUnix), terminal)
 	return err
 }
 
