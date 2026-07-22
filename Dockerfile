@@ -98,7 +98,7 @@ RUN sed -i "s|deb.debian.org|mirrors.ustc.edu.cn|g" /etc/apt/sources.list.d/debi
          arm64|aarch64) darch=aarch64 ;; \
          *) darch=x86_64 ;; \
        esac \
-    && curl -fsSL "https://download.docker.com/linux/static/stable/${darch}/docker-${DOCKER_CLI_VERSION}.tgz" \
+    && curl -fsSL -x http://10.0.0.10:7890 "https://download.docker.com/linux/static/stable/${darch}/docker-${DOCKER_CLI_VERSION}.tgz" \
          | tar -xz -C /tmp \
     && mv /tmp/docker/docker /usr/local/bin/docker \
     && chmod +x /usr/local/bin/docker \
@@ -109,10 +109,10 @@ RUN sed -i "s|deb.debian.org|mirrors.ustc.edu.cn|g" /etc/apt/sources.list.d/debi
 COPY requirements.txt /app/requirements.txt
 COPY requirements-store.txt /app/requirements-store.txt
 COPY turnstile-solver/requirements.txt /app/turnstile-solver-requirements.txt
-RUN python -m pip install --no-cache-dir -U pip setuptools wheel \
-    && python -m pip install --no-cache-dir -r /app/requirements.txt \
-    && python -m pip install --no-cache-dir -r /app/requirements-store.txt \
-    && python -m pip install --no-cache-dir -r /app/turnstile-solver-requirements.txt
+RUN python -m pip install --no-cache-dir --proxy http://10.0.0.10:7890 -U pip setuptools wheel \
+    && python -m pip install --no-cache-dir --proxy http://10.0.0.10:7890 -r /app/requirements.txt \
+    && python -m pip install --no-cache-dir --proxy http://10.0.0.10:7890 -r /app/requirements-store.txt \
+    && python -m pip install --no-cache-dir --proxy http://10.0.0.10:7890 -r /app/turnstile-solver-requirements.txt
 
 # Prefetch browser binaries used by inline solver
 RUN python -m camoufox fetch \
