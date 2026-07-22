@@ -3803,7 +3803,7 @@ def _run_registration(
             "refresh_token": bool(token.get("refresh_token")),
             "email": email,
         }
-        # Optional: auto-push newly registered accounts into sub2api.
+        # Optional: auto-transfer newly registered accounts into sub2api.
         # Controlled by settings → sub2api → auto_push_on_register.
         # Failures are recorded on the session but never fail registration.
         sub2api_push: dict[str, Any] | None = None
@@ -3812,7 +3812,7 @@ def _run_registration(
                 update(
                     "pushing_sub2api",
                     f"imported {len(imported_ids)} account(s); "
-                    f"checking auto-push to sub2api [{ADAPTER_BUILD}]",
+                    f"checking auto-transfer to sub2api [{ADAPTER_BUILD}]",
                     imported_account_ids=imported_ids,
                     imported_accounts=imported_accounts,
                 )
@@ -3828,7 +3828,7 @@ def _run_registration(
                     fail_n = int(sub2api_push.get("failed") or 0)
                     update(
                         "pushing_sub2api",
-                        f"sub2api auto-push done: ok={ok_n} fail={fail_n} "
+                        f"sub2api transfer push done: ok={ok_n} fail={fail_n} "
                         f"[{ADAPTER_BUILD}]",
                         imported_account_ids=imported_ids,
                         imported_accounts=imported_accounts,
@@ -3842,7 +3842,7 @@ def _run_registration(
                     "total": len(imported_ids),
                 }
                 sess["sub2api_push"] = sub2api_push
-                print(f"[grok-build-auth] WARN: sub2api auto-push failed: {e}")
+                print(f"[grok-build-auth] WARN: sub2api transfer push failed: {e}")
             # Optional: auto-push newly registered accounts into CLIProxyAPI.
             try:
                 from grok2api.upstream.cliproxyapi_client import (
@@ -3997,6 +3997,24 @@ def _run_registration(
                     pass
         except Exception as rexc:
             print(f"[grok-build-auth] WARN: post-register re-enable failed: {rexc}")
+
+        # Transfer ownership only after every local post-registration consumer
+        # (CLIProxyAPI push, probe, pool normalization) has finished.
+        transferred_n = 0
+        if sub2api_push and not sub2api_push.get("skipped"):
+            try:
+                from grok2api.upstream.sub2api_client import finalize_auto_transfer
+
+                sub2api_push = finalize_auto_transfer(sub2api_push)
+                sess["sub2api_push"] = sub2api_push
+                transferred_n = int(sub2api_push.get("cleaned") or 0)
+                sess["transferred_account_ids"] = list(sub2api_push.get("cleaned_ids") or [])
+            except Exception as transfer_exc:  # noqa: BLE001
+                sub2api_push["ok"] = False
+                sub2api_push["cleanup_error"] = str(transfer_exc)
+                sub2api_push["cleanup_failed"] = int(sub2api_push.get("success") or 0)
+                sess["sub2api_push"] = sub2api_push
+                print(f"[grok-build-auth] WARN: sub2api auto-transfer cleanup failed: {transfer_exc}")
         sess["probe"] = {
             "count": len(probe_summaries),
             "ok": sum(1 for p in probe_summaries if p.get("ok")),
@@ -4009,11 +4027,14 @@ def _run_registration(
             "imported",
             f"imported via sso_to_auth_json "
             f"({len(imported_ids) or len(imported_rows)} account(s)); "
-            f"probe ok={ok_n} fail={fail_n} "
+            f"probe ok={ok_n} fail={fail_n}; "
+            f"sub2api transferred={transferred_n} "
             f"[{ADAPTER_BUILD}]",
             imported_account_ids=imported_ids,
             imported_accounts=imported_accounts,
             probe=sess.get("probe"),
+            sub2api_push=sub2api_push,
+            transferred_account_ids=sess.get("transferred_account_ids") or [],
         )
         return
     except _RegCancelled as exc:

@@ -44,8 +44,8 @@ def _default_config() -> dict[str, Any]:
         "group_name": "",
         "auto_create_group": True,
         "proxy_id": None,
-        # After protocol registration succeeds and the account is imported
-        # locally, automatically push it into sub2api (requires enabled + URL).
+        # After registration, push into sub2api and transfer local ownership
+        # after local probes and other integration hooks have completed.
         "auto_push_on_register": False,
         # How many accounts to push in parallel (local → sub2api)
         "concurrency": 4,
@@ -1161,14 +1161,14 @@ def maybe_auto_push_registered_accounts(
     cfg: dict[str, Any] | None = None,
     source: str = "register-email",
 ) -> dict[str, Any]:
-    """Push freshly registered local accounts into sub2api when configured.
+    """Push freshly registered accounts before transfer cleanup when configured.
 
     Safe no-op when:
     - ``auto_push_on_register`` is off
     - sub2api is not enabled / missing URL or credentials
     - no account ids were provided
 
-    Never raises — registration success must not fail because of sub2api push.
+    Never raises; the caller deletes successful local rows after local hooks finish.
     """
     ids = [str(x).strip() for x in (account_ids or []) if str(x).strip()]
     if not ids:
@@ -1247,6 +1247,58 @@ def maybe_auto_push_registered_accounts(
         print(
             f"[sub2api] auto_push_on_register source={source} "
             f"total={len(ids)} ok={ok_n} fail={fail_n}"
+        )
+    except Exception:
+        pass
+    return summary
+
+
+def finalize_auto_transfer(push_summary: dict[str, Any] | None) -> dict[str, Any]:
+    """Remove local ownership for accounts successfully pushed during registration."""
+    summary = push_summary if isinstance(push_summary, dict) else {}
+    if summary.get("skipped"):
+        return summary
+    rows = summary.get("results") or []
+    successful_ids: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("ok"):
+            continue
+        account_id = str(row.get("account_id") or "").strip()
+        if not account_id or account_id in seen:
+            continue
+        seen.add(account_id)
+        successful_ids.append(account_id)
+
+    summary["cleanup_requested"] = len(successful_ids)
+    summary["cleaned"] = 0
+    summary["cleaned_ids"] = []
+    summary["cleanup_failed"] = 0
+    if not successful_ids:
+        return summary
+    try:
+        cleanup = accounts.remove_accounts(successful_ids)
+        removed = [str(x).strip() for x in (cleanup.get("removed") or []) if str(x).strip()]
+        missing = [str(x).strip() for x in (cleanup.get("missing") or []) if str(x).strip()]
+        cleaned_ids = list(dict.fromkeys([*removed, *missing]))
+        cleaned_set = set(cleaned_ids)
+        for row in rows:
+            if isinstance(row, dict) and str(row.get("account_id") or "").strip() in cleaned_set:
+                row["local_deleted"] = True
+        summary["cleaned"] = len(cleaned_ids)
+        summary["cleaned_ids"] = cleaned_ids
+        summary["cleanup_missing"] = len(missing)
+        summary["cleanup_failed"] = max(0, len(successful_ids) - len(cleaned_ids))
+    except Exception as exc:  # noqa: BLE001
+        summary["cleanup_error"] = str(exc)
+        summary["cleanup_failed"] = len(successful_ids)
+    if int(summary.get("cleanup_failed") or 0) > 0:
+        summary["ok"] = False
+    try:
+        print(
+            f"[sub2api] auto_transfer cleanup_requested={len(successful_ids)} "
+            f"cleaned={summary.get('cleaned', 0)} "
+            f"cleanup_failed={summary.get('cleanup_failed', 0)}"
         )
     except Exception:
         pass

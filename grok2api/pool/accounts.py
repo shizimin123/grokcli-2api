@@ -395,9 +395,18 @@ def remove_account(account_id: str) -> bool:
 
 
 def remove_accounts(account_ids: list[str]) -> dict:
-    """Remove many accounts from durable store (PG/file) in one rewrite."""
+    """Remove selected accounts directly in PG, or in one rewrite in file mode."""
     data = read_auth_map()
-    removed: list[str] = []
+    pg_backend = None
+    try:
+        from grok2api.store import accounts_pg
+
+        if accounts_pg.enabled():
+            pg_backend = accounts_pg
+    except ImportError:
+        pass
+
+    targets: list[str] = []
     missing: list[str] = []
     seen: set[str] = set()
     for raw in account_ids:
@@ -406,19 +415,40 @@ def remove_accounts(account_ids: list[str]) -> dict:
             continue
         seen.add(account_id)
         matched = _resolve_account_key(data, account_id)
+        if pg_backend is not None:
+            # A cached auth-map snapshot can briefly miss a just-imported row.
+            # Let PostgreSQL decide whether the exact requested ID exists.
+            targets.append(matched or account_id)
+            continue
         if matched is None or matched not in data:
             missing.append(account_id)
             continue
-        del data[matched]
-        removed.append(matched)
-    if removed:
+        targets.append(matched)
+
+    if pg_backend is not None:
+        result = pg_backend.delete_accounts(targets)
+        actual_removed = list(result.get("removed") or [])
+        missing.extend(str(x) for x in (result.get("missing") or []))
+        if actual_removed:
+            _cleanup_account_side_state(actual_removed)
+        return {
+            "removed": actual_removed,
+            "missing": missing,
+            "removed_count": len(actual_removed),
+            "missing_count": len(missing),
+            "requested": len(seen),
+        }
+
+    for matched in targets:
+        data.pop(matched, None)
+    if targets:
         _backup_auth_file()
         write_auth_map(data)  # PG primary (no auth.json mirror)
-        _cleanup_account_side_state(removed)
+        _cleanup_account_side_state(targets)
     return {
-        "removed": removed,
+        "removed": targets,
         "missing": missing,
-        "removed_count": len(removed),
+        "removed_count": len(targets),
         "missing_count": len(missing),
         "requested": len(seen),
     }

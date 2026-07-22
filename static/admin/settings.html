@@ -549,8 +549,8 @@
       <label class="g2a-check"><input type="checkbox" id="set-sub2api-auto-group" checked /> 分组不存在时自动创建</label>
     </div>
     <div class="g2a-field">
-      <label class="g2a-check"><input type="checkbox" id="set-sub2api-auto-push-register" /> 注册成功后自动入库 sub2api</label>
-      <div class="g2a-muted" style="margin-top:4px">勾选后会<strong>同时启用</strong> sub2api 导入；协议注册入库本地后立刻推送到上方分组（需填好 URL/登录/分组）。点「保存设置」后生效。</div>
+      <label class="g2a-check"><input type="checkbox" id="set-sub2api-auto-push-register" /> 注册成功后自动转移到 sub2api</label>
+      <div class="g2a-muted" style="margin-top:4px">勾选后会<strong>同时启用</strong> sub2api 导入；本地完成测活和其他同步后转移到上方分组，成功项从本地删除，失败项保留。点「保存设置」后生效。</div>
     </div>
     <div class="g2a-field">
       <label for="set-sub2api-concurrency">推送并发</label>
@@ -590,7 +590,7 @@
   <pre id="sub2api-test-result" class="g2a-log" style="margin-top:10px;max-height:160px;display:none"></pre>
   <p class="g2a-muted" style="margin:10px 0 0;line-height:1.55" id="sub2api-hint">
     保存后到「账号」页：可「导入 sub2api（选中/全部）」在线推送；或「导出 sub2api 数据」下载官方 <code>sub2api-data</code> 备份，在 sub2api 管理台「导入数据」上传。
-    勾选「注册成功后自动入库 sub2api」后，协议注册导入本地账号会<strong>立刻</strong>推送到上方配置的分组。
+    勾选「注册成功后自动转移到 sub2api」后，协议注册账号会推送到上方分组；本地测活完成后仅删除推送成功项。
   </p>
 </section>
     </div>

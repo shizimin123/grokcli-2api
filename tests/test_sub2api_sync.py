@@ -158,6 +158,53 @@ class Sub2APISyncTest(unittest.TestCase):
             "/api/v1/admin/accounts/30/clear-error",
         )
 
+    def test_finalize_auto_transfer_removes_only_successes(self):
+        summary = {
+            "ok": False,
+            "success": 2,
+            "failed": 1,
+            "results": [
+                {"account_id": "acc-1", "ok": True},
+                {"account_id": "acc-2", "ok": False},
+                {"account_id": "acc-3", "ok": True},
+                {"account_id": "acc-1", "ok": True},
+            ],
+        }
+        with patch.object(
+            sub2.accounts,
+            "remove_accounts",
+            return_value={"removed": ["acc-1"], "missing": ["acc-3"]},
+            create=True,
+        ) as remove:
+            result = sub2.finalize_auto_transfer(summary)
+
+        remove.assert_called_once_with(["acc-1", "acc-3"])
+        self.assertEqual(result["cleaned"], 2)
+        self.assertEqual(result["cleanup_failed"], 0)
+        self.assertTrue(result["results"][0]["local_deleted"])
+        self.assertNotIn("local_deleted", result["results"][1])
+        self.assertTrue(result["results"][2]["local_deleted"])
+
+    def test_finalize_auto_transfer_reports_cleanup_failure(self):
+        summary = {
+            "ok": True,
+            "success": 1,
+            "failed": 0,
+            "results": [{"account_id": "acc-1", "ok": True}],
+        }
+        with patch.object(
+            sub2.accounts,
+            "remove_accounts",
+            side_effect=RuntimeError("database unavailable"),
+            create=True,
+        ):
+            result = sub2.finalize_auto_transfer(summary)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["cleaned"], 0)
+        self.assertEqual(result["cleanup_failed"], 1)
+        self.assertIn("database unavailable", result["cleanup_error"])
+
 
 if __name__ == "__main__":
     unittest.main()

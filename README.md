@@ -507,7 +507,7 @@ Claude Code / Cursor / Cherry Studio：Base URL 填服务地址（通常带 `/v1
 - 分组按本次请求、已保存分组 ID、分组名称依次解析；开启自动创建后，缺失的默认分组会创建为 `grokcli-2api`
 - 代理优先使用账号保存的 `proxy` / `proxy_url`，否则按本地出站代理池稳定选择；sub2api 必须已有协议、主机、端口一致的代理记录
 - 同名 Grok 账号采用 upsert；远端已有更新凭证时不会被旧 token 覆盖，其余重复账号会设为 `inactive`
-- 选中转移只清理逐条导入成功的本地账号；“导入全部”和注册后自动推送不会清理本地
+- 选中转移和注册后自动转移只清理逐条导入成功的本地账号；“导入全部”不会清理本地
 - 已被 xAI 吊销的 refresh token 无法通过重试恢复，需要重新授权后再同步
 
 API：
@@ -698,7 +698,7 @@ docker-compose.yml                       # redis + postgres（内网）+ app
   - **Update both-complete 路径纠偏（Claude Code → sub2api）**：两边都是完整 Update/Edit 时，**后到完整参数为准**（`path` 可覆盖错误 `file_path`）；不完整后到仍不能覆盖完整先到
   - doubled JSON / 流式 merge 同步；`normalize` 不同路径值时 **later wins**；同值保留 `file_path` 拼写
   - OpenAI Responses 本地 merge 镜像同步；回归覆盖 both-complete / doubled both-complete
-  - **注册成功后自动入库 sub2api**（设置项 `auto_push_on_register`）：协议注册导入本地后立刻 `push_account`；失败不拖垮注册
+  - **注册成功后自动转移 sub2api**（设置项 `auto_push_on_register`）：协议注册完成本地测活和其他同步后转移；成功项删除本地，失败项保留且不拖垮注册
   - 继承 v1.9.81：注册 SSO 入库与备份、系统设置扩展、sub2api 账号容量、进度卡防连环 toast
 - **v1.9.81**
   - **Update 偶发失效修复（Claude Code → sub2api）**：后到**完整** Update/Edit 参数覆盖先到的错误 `file_path` 预览；完整包不被不完整 path 别名覆盖；`target_file` 等别名归一

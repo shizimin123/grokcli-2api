@@ -639,6 +639,47 @@ def delete_account(account_id: str) -> bool:
     return deleted
 
 
+def delete_accounts(account_ids: list[str]) -> dict[str, Any]:
+    """Delete selected accounts directly without rewriting the full account map."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for raw in account_ids:
+        account_id = str(raw or "").strip()
+        if not account_id or account_id in seen:
+            continue
+        seen.add(account_id)
+        ids.append(account_id)
+    removed: list[str] = []
+    missing: list[str] = []
+    if not ids:
+        return {
+            "removed": removed,
+            "missing": missing,
+            "removed_count": 0,
+            "missing_count": 0,
+            "requested": 0,
+        }
+    with connection() as conn:
+        with conn.cursor() as cur:
+            for account_id in ids:
+                cur.execute("DELETE FROM accounts WHERE id = %s", (account_id,))
+                if cur.rowcount > 0:
+                    removed.append(account_id)
+                else:
+                    missing.append(account_id)
+                cur.execute("DELETE FROM account_pool WHERE account_id = %s", (account_id,))
+        conn.commit()
+    if removed:
+        invalidate_auth_map_cache()
+    return {
+        "removed": removed,
+        "missing": missing,
+        "removed_count": len(removed),
+        "missing_count": len(missing),
+        "requested": len(ids),
+    }
+
+
 def _upsert_one(cur, account_id: str, entry: dict[str, Any]) -> None:
     email = entry.get("email")
     user_id = entry.get("user_id") or entry.get("principal_id")
