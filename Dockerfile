@@ -2,6 +2,7 @@
 FROM golang:1.24-bookworm AS go-builder
 
 WORKDIR /src
+ENV GOPROXY=https://goproxy.cn,direct
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
@@ -58,7 +59,7 @@ WORKDIR /app
 # Static docker CLI for in-container hot-update (needs docker.sock mount at runtime).
 ARG DOCKER_CLI_VERSION=27.5.1
 ARG TARGETARCH
-RUN apt-get update \
+RUN sed -i "s|deb.debian.org|mirrors.ustc.edu.cn|g" /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true && apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
