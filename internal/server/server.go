@@ -8715,6 +8715,11 @@ func servePushSub2API(w http.ResponseWriter, r *http.Request, options Options) {
 	if body["all"] == true {
 		ids = nil
 	}
+	selectedTransfer := body["all"] != true
+	if selectedTransfer && len(ids) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "account_ids is required for selected sub2api import", "ok": false})
+		return
+	}
 	var groupID *int
 	if v, ok := body["group_id"]; ok && v != nil {
 		switch t := v.(type) {
@@ -8737,7 +8742,90 @@ func servePushSub2API(w http.ResponseWriter, r *http.Request, options Options) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error(), "ok": false})
 		return
 	}
+	if selectedTransfer {
+		successfulIDs := successfulSub2APIAccountIDs(out, ids)
+		out["cleanup_requested"] = len(successfulIDs)
+		out["cleaned"] = 0
+		cleanup, cleanupErr := options.Store.DeleteAccounts(r.Context(), successfulIDs)
+		if cleanupErr != nil {
+			out["ok"] = false
+			out["cleanup_error"] = cleanupErr.Error()
+			out["cleanup_failed"] = len(successfulIDs)
+		} else {
+			removed := stringSlice(cleanup["removed"])
+			missing := stringSlice(cleanup["missing"])
+			cleaned := append(append([]string{}, removed...), missing...)
+			out["cleaned"] = len(cleaned)
+			out["cleaned_ids"] = cleaned
+			out["cleanup_missing"] = len(missing)
+			out["cleanup_failed"] = 0
+			markSub2APILocalCleanup(out, cleaned)
+		}
+		out["message"] = fmt.Sprintf("sub2api 导入完成：成功 %v / 失败 %v / 共 %v · 本地清理 %v", out["success"], out["failed"], out["total"], out["cleaned"])
+	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func successfulSub2APIAccountIDs(result map[string]any, requested []string) []string {
+	allowed := make(map[string]struct{}, len(requested))
+	for _, id := range requested {
+		if id = strings.TrimSpace(id); id != "" {
+			allowed[id] = struct{}{}
+		}
+	}
+	seen := map[string]struct{}{}
+	out := []string{}
+	visit := func(row map[string]any) {
+		if row == nil || row["ok"] != true {
+			return
+		}
+		id := strings.TrimSpace(stringValue(row["account_id"]))
+		if _, ok := allowed[id]; !ok {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	switch rows := result["results"].(type) {
+	case []map[string]any:
+		for _, row := range rows {
+			visit(row)
+		}
+	case []any:
+		for _, raw := range rows {
+			row, _ := raw.(map[string]any)
+			visit(row)
+		}
+	}
+	return out
+}
+
+func markSub2APILocalCleanup(result map[string]any, cleanedIDs []string) {
+	cleaned := make(map[string]struct{}, len(cleanedIDs))
+	for _, id := range cleanedIDs {
+		cleaned[id] = struct{}{}
+	}
+	mark := func(row map[string]any) {
+		id := strings.TrimSpace(stringValue(row["account_id"]))
+		if _, ok := cleaned[id]; ok {
+			row["local_deleted"] = true
+		}
+	}
+	switch rows := result["results"].(type) {
+	case []map[string]any:
+		for _, row := range rows {
+			mark(row)
+		}
+	case []any:
+		for _, raw := range rows {
+			if row, ok := raw.(map[string]any); ok {
+				mark(row)
+			}
+		}
+	}
 }
 
 func serveSub2APITest(w http.ResponseWriter, r *http.Request, options Options) {

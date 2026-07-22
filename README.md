@@ -488,7 +488,7 @@ Claude Code / Cursor / Cherry Studio：Base URL 填服务地址（通常带 `/v1
 | SSO Cookie | 粘贴或上传；后台 Device Flow 换 token，页面显示进度条与明细 |
 | JSON 文件 | 支持多文件合并导入；解析 → 入库全程进度 |
 | 导出全部 / 选中 | 后台打包，完成后自动下载；大池不阻塞页面 |
-| **导入 sub2api** | 设置页配置 URL/登录/分组；账号页支持**选中/全部在线推送**；亦可导出官方 `sub2api-data` 备份供手动导入 |
+| **导入 sub2api** | 设置页配置 URL/登录/分组；选中账号使用转移模式，远端成功后清理本地；全部导入仅复制；亦可导出官方 `sub2api-data` 备份供手动导入 |
 
 导入导出、测活、续期等完成后，可在 **任务日志** 按类型 / 状态 / 关键词查询历史结果。
 
@@ -498,7 +498,7 @@ Claude Code / Cursor / Cherry Studio：Base URL 填服务地址（通常带 `/v1
 1. **系统设置 → sub2api 导入**：填写 sub2api URL、管理员邮箱/密码，设置默认分组（ID 或名称；可不存在时自动创建）
 2. 点 **测试连接** / **刷新分组** 确认可达
 3. **账号 / 轮询** 页：
-   - 勾选账号 → **导入 sub2api（选中）**
+   - 勾选账号 → **转移到 sub2api（选中）**；远端导入成功的账号会从本地删除，失败项保留
    - 或 **导入 sub2api（全部）**
    - **导出 sub2api 数据**：下载官方 `type=sub2api-data` 备份 JSON（含 token），可在 sub2api「导入数据」直接上传
 4. 推送优先使用本地 access/refresh token 创建 `platform=grok` + `type=oauth` 账号；无 token 时回退 SSO→OAuth
@@ -507,6 +507,7 @@ Claude Code / Cursor / Cherry Studio：Base URL 填服务地址（通常带 `/v1
 - 分组按本次请求、已保存分组 ID、分组名称依次解析；开启自动创建后，缺失的默认分组会创建为 `grokcli-2api`
 - 代理优先使用账号保存的 `proxy` / `proxy_url`，否则按本地出站代理池稳定选择；sub2api 必须已有协议、主机、端口一致的代理记录
 - 同名 Grok 账号采用 upsert；远端已有更新凭证时不会被旧 token 覆盖，其余重复账号会设为 `inactive`
+- 选中转移只清理逐条导入成功的本地账号；“导入全部”和注册后自动推送不会清理本地
 - 已被 xAI 吊销的 refresh token 无法通过重试恢复，需要重新授权后再同步
 
 API：
