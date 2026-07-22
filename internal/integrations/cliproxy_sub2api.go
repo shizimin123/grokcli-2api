@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -401,6 +404,152 @@ func sub2Config(ctx context.Context, store Store) map[string]any {
 	return m
 }
 
+func boolField(m map[string]any, key string, fallback bool) bool {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return fallback
+	}
+	switch value := v.(type) {
+	case bool:
+		return value
+	case string:
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		}
+	}
+	return fallback
+}
+
+func configuredSub2ProxyPool(ctx context.Context, store Store) []string {
+	if store == nil {
+		return nil
+	}
+	enabled := true
+	proxyText := ""
+	if raw, err := store.GetSetting(ctx, "outbound_proxy_config"); err == nil {
+		if cfg, ok := raw.(map[string]any); ok && cfg != nil {
+			enabled = boolField(cfg, "enabled", true)
+			proxyText = stringField(cfg, "proxy")
+		}
+	}
+	if proxyText == "" {
+		if raw, err := store.GetSetting(ctx, "registration_config"); err == nil {
+			if cfg, ok := raw.(map[string]any); ok && cfg != nil {
+				proxyText = stringField(cfg, "proxy")
+			}
+		}
+	}
+	if !enabled || proxyText == "" {
+		return nil
+	}
+	return strings.Fields(proxyText)
+}
+
+func pickConfiguredProxy(pool []string, accountID string) string {
+	if len(pool) == 0 {
+		return ""
+	}
+	if len(pool) == 1 {
+		return pool[0]
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(accountID))
+	return pool[int(h.Sum32())%len(pool)]
+}
+
+func proxyEndpoint(raw string) (string, string, int, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", 0, false
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Hostname() == "" {
+		return "", "", 0, false
+	}
+	protocol := strings.ToLower(parsed.Scheme)
+	if protocol == "socks5h" {
+		protocol = "socks5"
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil || port <= 0 {
+		if strings.HasPrefix(protocol, "socks") {
+			port = 1080
+		} else {
+			port = 8080
+		}
+	}
+	return protocol, strings.ToLower(parsed.Hostname()), port, true
+}
+
+func matchSub2ProxyID(raw string, proxies []map[string]any) int {
+	protocol, host, port, ok := proxyEndpoint(raw)
+	if !ok {
+		return 0
+	}
+	for _, proxy := range proxies {
+		remoteProtocol := strings.ToLower(stringField(proxy, "protocol"))
+		if remoteProtocol == "socks5h" {
+			remoteProtocol = "socks5"
+		}
+		if remoteProtocol == protocol && strings.EqualFold(stringField(proxy, "host"), host) && intField(proxy, "port", 0) == port {
+			return intField(proxy, "id", 0)
+		}
+	}
+	return 0
+}
+
+func resolveSub2GroupID(ctx context.Context, store Store, cfg map[string]any, base, token string, requested *int) (int, error) {
+	if requested != nil && *requested > 0 {
+		return *requested, nil
+	}
+	if gid := intField(cfg, "group_id", 0); gid > 0 {
+		return gid, nil
+	}
+	groups, err := sub2ListGroups(ctx, base, token)
+	if err != nil {
+		return 0, fmt.Errorf("group_id missing and list groups failed: %w", err)
+	}
+	name := firstNonEmpty(stringField(cfg, "group_name"), "grokcli-2api")
+	for _, group := range groups {
+		if strings.EqualFold(stringField(group, "name"), name) {
+			gid := intField(group, "id", 0)
+			if gid > 0 {
+				_, _ = SaveConfig(ctx, store, "sub2api_config", map[string]any{"group_id": gid, "group_name": name})
+				return gid, nil
+			}
+		}
+	}
+	if !boolField(cfg, "auto_create_group", true) {
+		return 0, fmt.Errorf("sub2api group not found: %s", name)
+	}
+	created, err := sub2CreateGroup(ctx, base, token, name, "grok")
+	if err != nil {
+		return 0, err
+	}
+	gid := intField(created, "id", 0)
+	if gid <= 0 {
+		if groups, listErr := sub2ListGroups(ctx, base, token); listErr == nil {
+			for _, group := range groups {
+				if strings.EqualFold(stringField(group, "name"), name) {
+					gid = intField(group, "id", 0)
+					break
+				}
+			}
+		}
+	}
+	if gid <= 0 {
+		return 0, fmt.Errorf("group created but id missing: %s", name)
+	}
+	_, _ = SaveConfig(ctx, store, "sub2api_config", map[string]any{"group_id": gid, "group_name": name})
+	return gid, nil
+}
+
 func TestSub2API(ctx context.Context, cfg map[string]any) map[string]any {
 	base := strings.TrimRight(stringField(cfg, "base_url"), "/")
 	email := stringField(cfg, "email")
@@ -543,31 +692,9 @@ func PushSub2API(ctx context.Context, store Store, ids []string, groupID *int, c
 	if err != nil {
 		return map[string]any{"ok": false, "error": "sub2api login failed: " + err.Error(), "success": 0, "failed": 0, "total": 0}, nil
 	}
-	gid := 0
-	if groupID != nil && *groupID > 0 {
-		gid = *groupID
-	} else {
-		gid = intField(cfg, "group_id", 0)
-	}
-	if gid <= 0 {
-		// try resolve by name or first group
-		groups, gerr := sub2ListGroups(ctx, base, token)
-		if gerr != nil {
-			return map[string]any{"ok": false, "error": "group_id missing and list groups failed: " + gerr.Error(), "success": 0, "failed": 0, "total": 0}, nil
-		}
-		wantName := stringField(cfg, "group_name")
-		for _, g := range groups {
-			if wantName != "" && strings.EqualFold(stringField(g, "name"), wantName) {
-				gid = intField(g, "id", 0)
-				break
-			}
-		}
-		if gid <= 0 && len(groups) > 0 {
-			gid = intField(groups[0], "id", 0)
-		}
-	}
-	if gid <= 0 {
-		return map[string]any{"ok": false, "error": "sub2api group_id 未配置，请先选择/创建分组", "success": 0, "failed": 0, "total": 0}, nil
+	gid, err := resolveSub2GroupID(ctx, store, cfg, base, token, groupID)
+	if err != nil {
+		return map[string]any{"ok": false, "error": err.Error(), "success": 0, "failed": 0, "total": 0}, nil
 	}
 
 	authMap, err := store.ExportAuthMap(ctx, ids, true)
@@ -575,6 +702,22 @@ func PushSub2API(ctx context.Context, store Store, ids []string, groupID *int, c
 		return nil, err
 	}
 	auth, _ := authMap["auth"].(map[string]any)
+	proxyPool := configuredSub2ProxyPool(ctx, store)
+	defaultProxyID := intField(cfg, "proxy_id", 0)
+	needsProxyLookup := len(proxyPool) > 0
+	for _, raw := range auth {
+		if entry, ok := raw.(map[string]any); ok && firstNonEmpty(stringField(entry, "proxy"), stringField(entry, "proxy_url")) != "" {
+			needsProxyLookup = true
+			break
+		}
+	}
+	remoteProxies := []map[string]any{}
+	if defaultProxyID <= 0 && needsProxyLookup {
+		remoteProxies, err = sub2ListProxies(ctx, base, token)
+		if err != nil {
+			return map[string]any{"ok": false, "error": "list sub2api proxies failed: " + err.Error(), "success": 0, "failed": 0, "total": 0}, nil
+		}
+	}
 	notesPrefix := firstNonEmpty(stringField(cfg, "notes_prefix"), "grokcli-2api")
 	accConc := intField(cfg, "account_concurrency", 3)
 	accPrio := intField(cfg, "account_priority", 50)
@@ -615,7 +758,7 @@ func PushSub2API(ctx context.Context, store Store, ids []string, groupID *int, c
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			row := pushOneSub2(ctx, client, base, token, gid, notesPrefix, accConc, accPrio, accRate, it.id, it.entry)
+			row := pushOneSub2(ctx, client, base, token, gid, notesPrefix, accConc, accPrio, accRate, defaultProxyID, proxyPool, remoteProxies, it.id, it.entry)
 			ch <- res{row: row}
 		}(it)
 	}
@@ -642,11 +785,25 @@ func PushSub2API(ctx context.Context, store Store, ids []string, groupID *int, c
 	}, nil
 }
 
-func pushOneSub2(ctx context.Context, client *http.Client, base, token string, gid int, notesPrefix string, accConc, accPrio int, accRate float64, aid string, entry map[string]any) map[string]any {
+func pushOneSub2(ctx context.Context, client *http.Client, base, token string, gid int, notesPrefix string, accConc, accPrio int, accRate float64, defaultProxyID int, proxyPool []string, remoteProxies []map[string]any, aid string, entry map[string]any) map[string]any {
 	email := stringField(entry, "email")
 	access := firstNonEmpty(stringField(entry, "key"), stringField(entry, "access_token"), stringField(entry, "token"))
 	refresh := stringField(entry, "refresh_token")
 	out := map[string]any{"account_id": aid, "email": email, "ok": false, "method": "oauth_token"}
+	proxyID := defaultProxyID
+	localProxy := firstNonEmpty(stringField(entry, "proxy"), stringField(entry, "proxy_url"))
+	if localProxy == "" {
+		localProxy = pickConfiguredProxy(proxyPool, aid)
+	}
+	if proxyID <= 0 && localProxy != "" {
+		proxyID = matchSub2ProxyID(localProxy, remoteProxies)
+		if proxyID <= 0 {
+			_, host, port, _ := proxyEndpoint(localProxy)
+			out["error"] = fmt.Sprintf("sub2api matching proxy not found for %s:%d", host, port)
+			out["method"] = "proxy_match"
+			return out
+		}
+	}
 	if access == "" {
 		// try SSO path
 		sso := accounts.GetSSOValue(entry)
@@ -656,7 +813,7 @@ func pushOneSub2(ctx context.Context, client *http.Client, base, token string, g
 			return out
 		}
 		// SSO → OAuth
-		creds, err := sub2SSOToOAuth(ctx, client, base, token, []string{sso})
+		creds, err := sub2SSOToOAuth(ctx, client, base, token, []string{sso}, proxyID)
 		if err != nil || len(creds) == 0 {
 			out["error"] = "sso-to-oauth failed"
 			if err != nil {
@@ -685,13 +842,17 @@ func pushOneSub2(ctx context.Context, client *http.Client, base, token string, g
 	if exp := accounts.ParseExpiresAt(entry["expires_at"], access); exp != nil {
 		credentials["expires_at"] = time.Unix(int64(*exp), 0).UTC().Format(time.RFC3339)
 	}
+	var proxyValue any
+	if proxyID > 0 {
+		proxyValue = proxyID
+	}
 	body := map[string]any{
 		"name":            trimLen(name, 200),
 		"platform":        "grok",
 		"type":            "oauth",
 		"credentials":     credentials,
 		"extra":           map[string]any{},
-		"proxy_id":        nil,
+		"proxy_id":        proxyValue,
 		"group_ids":       []int{gid},
 		"concurrency":     accConc,
 		"priority":        accPrio,
@@ -706,6 +867,7 @@ func pushOneSub2(ctx context.Context, client *http.Client, base, token string, g
 	out["ok"] = true
 	out["remote"] = map[string]any{"id": created["id"], "name": created["name"]}
 	out["group_id"] = gid
+	out["proxy_id"] = proxyValue
 	return out
 }
 
@@ -776,6 +938,34 @@ func sub2ListGroups(ctx context.Context, base, token string) ([]map[string]any, 
 					out = append(out, mm)
 				}
 			}
+		}
+	}
+	return out, nil
+}
+
+func sub2ListProxies(ctx context.Context, base, token string) ([]map[string]any, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/v1/admin/proxies", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "grokcli-2api-sub2api-push/1.0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("proxies status %d: %s", resp.StatusCode, string(raw))
+	}
+	var parsed any
+	_ = json.Unmarshal(raw, &parsed)
+	arr := digArray(parsed, "data", "data.items", "items", "proxies")
+	out := []map[string]any{}
+	for _, item := range arr {
+		if proxy, ok := item.(map[string]any); ok {
+			out = append(out, proxy)
 		}
 	}
 	return out, nil
@@ -864,8 +1054,12 @@ func sub2CreateAccount(ctx context.Context, client *http.Client, base, token str
 	return map[string]any{"raw": string(raw)}, nil
 }
 
-func sub2SSOToOAuth(ctx context.Context, client *http.Client, base, token string, ssoList []string) ([]map[string]any, error) {
-	payload, _ := json.Marshal(map[string]any{"sso_tokens": ssoList, "proxy_id": nil})
+func sub2SSOToOAuth(ctx context.Context, client *http.Client, base, token string, ssoList []string, proxyID int) ([]map[string]any, error) {
+	var proxyValue any
+	if proxyID > 0 {
+		proxyValue = proxyID
+	}
+	payload, _ := json.Marshal(map[string]any{"sso_tokens": ssoList, "proxy_id": proxyValue})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/v1/admin/grok/sso-to-oauth", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err

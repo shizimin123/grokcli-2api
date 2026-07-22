@@ -40,6 +40,7 @@ def _default_config() -> dict[str, Any]:
         "group_id": None,
         "group_name": "",
         "auto_create_group": True,
+        "proxy_id": None,
         # After protocol registration succeeds and the account is imported
         # locally, automatically push it into sub2api (requires enabled + URL).
         "auto_push_on_register": False,
@@ -80,6 +81,11 @@ def _normalize_config(raw: Any, *, include_secrets: bool = True) -> dict[str, An
             out["group_id"] = None
     out["group_name"] = str(raw.get("group_name") or "").strip()
     out["auto_create_group"] = bool(raw.get("auto_create_group", True))
+    proxy_id = raw.get("proxy_id")
+    try:
+        out["proxy_id"] = int(proxy_id) if proxy_id not in (None, "", 0, "0") else None
+    except (TypeError, ValueError):
+        out["proxy_id"] = None
     # Accept several aliases from UI / older drafts
     auto_push = raw.get("auto_push_on_register")
     if auto_push is None:
@@ -423,6 +429,76 @@ def list_groups(cfg: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     return out
 
 
+def list_proxies(cfg: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    status, parsed, raw = _request_authed("GET", "/api/v1/admin/proxies", cfg=cfg)
+    if status < 200 or status >= 300:
+        raise RuntimeError(_api_error_message(status, parsed, raw))
+    if isinstance(parsed, dict):
+        code = parsed.get("code")
+        if code not in (None, 0, "0", 200, "200"):
+            raise RuntimeError(_api_error_message(status, parsed, raw))
+    data = _unwrap_data(parsed)
+    items: Any = data
+    if isinstance(data, dict):
+        items = data.get("items") or data.get("proxies") or data.get("list") or []
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _proxy_endpoint(proxy_url: str) -> tuple[str, str, int] | None:
+    raw = str(proxy_url or "").strip()
+    if not raw:
+        return None
+    parsed = urllib.parse.urlparse(raw if "://" in raw else f"http://{raw}")
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return None
+    scheme = (parsed.scheme or "http").strip().lower()
+    if scheme == "socks5h":
+        scheme = "socks5"
+    try:
+        port = parsed.port or (1080 if scheme.startswith("socks") else 8080)
+    except ValueError:
+        return None
+    return scheme, host, int(port)
+
+
+def resolve_proxy_id(
+    account_id: str,
+    entry: dict[str, Any],
+    cfg: dict[str, Any] | None = None,
+) -> int | None:
+    cfg = cfg or get_sub2api_config(include_secrets=True)
+    if cfg.get("proxy_id"):
+        return int(cfg["proxy_id"])
+    local_proxy = str(entry.get("proxy") or entry.get("proxy_url") or "").strip()
+    if not local_proxy:
+        try:
+            from grok2api.upstream.proxy_pool import pick_proxy_for_account
+
+            local_proxy = str(pick_proxy_for_account(account_id) or "").strip()
+        except Exception:
+            local_proxy = ""
+    endpoint = _proxy_endpoint(local_proxy)
+    if endpoint is None:
+        return None
+    scheme, host, port = endpoint
+    for remote in list_proxies(cfg):
+        remote_scheme = str(remote.get("protocol") or "http").strip().lower()
+        if remote_scheme == "socks5h":
+            remote_scheme = "socks5"
+        remote_host = str(remote.get("host") or "").strip().lower()
+        try:
+            remote_port = int(remote.get("port") or 0)
+            remote_id = int(remote.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if remote_id > 0 and (remote_scheme, remote_host, remote_port) == (scheme, host, port):
+            return remote_id
+    raise RuntimeError(f"sub2api matching proxy not found for {scheme}://{host}:{port}")
+
+
 def create_group(
     name: str,
     *,
@@ -592,6 +668,7 @@ def _expires_at_iso(entry: dict[str, Any], access_token: str) -> str | None:
 def sso_to_oauth(
     sso_tokens: list[str],
     *,
+    proxy_id: int | None = None,
     cfg: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     tokens = [str(x).strip() for x in sso_tokens if str(x).strip()]
@@ -601,7 +678,7 @@ def sso_to_oauth(
         "POST",
         "/api/v1/admin/grok/sso-to-oauth",
         cfg=cfg,
-        body={"sso_tokens": tokens, "proxy_id": None},
+        body={"sso_tokens": tokens, "proxy_id": proxy_id},
         timeout=120,
     )
     if status < 200 or status >= 300:
@@ -629,6 +706,7 @@ def create_grok_oauth_account(
     email: str = "",
     expires_at: str | None = None,
     notes: str = "",
+    proxy_id: int | None = None,
     cfg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     credentials: dict[str, Any] = {
@@ -661,7 +739,7 @@ def create_grok_oauth_account(
         "type": "oauth",
         "credentials": credentials,
         "extra": {},
-        "proxy_id": None,
+        "proxy_id": proxy_id,
         "group_ids": [int(group_id)],
         "concurrency": acc_conc,
         "priority": acc_prio,
@@ -703,6 +781,16 @@ def push_account(
     notes = f"{notes_prefix}:{aid}"
     name = email or aid
     gid = int(group_id or resolve_group_id(cfg))
+    try:
+        proxy_id = resolve_proxy_id(aid, entry, cfg)
+    except Exception as e:  # noqa: BLE001
+        return {
+            "ok": False,
+            "account_id": aid,
+            "email": email,
+            "error": str(e),
+            "method": "proxy_match",
+        }
 
     # Path A: direct OAuth with local tokens
     if access:
@@ -715,6 +803,7 @@ def push_account(
                 email=email,
                 expires_at=_expires_at_iso(entry, access),
                 notes=notes,
+                proxy_id=proxy_id,
                 cfg=cfg,
             )
             return {
@@ -723,6 +812,7 @@ def push_account(
                 "email": email,
                 "method": "oauth_token",
                 "group_id": gid,
+                "proxy_id": proxy_id,
                 "remote": {
                     "id": created.get("id"),
                     "name": created.get("name"),
@@ -754,7 +844,7 @@ def push_account(
 
     # Path B: SSO → OAuth then create
     try:
-        results = sso_to_oauth(sso_list, cfg=cfg)
+        results = sso_to_oauth(sso_list, proxy_id=proxy_id, cfg=cfg)
     except Exception as e:  # noqa: BLE001
         return {
             "ok": False,
@@ -808,6 +898,7 @@ def push_account(
             email=email,
             expires_at=exp_iso,
             notes=notes,
+            proxy_id=proxy_id,
             cfg=cfg,
         )
         return {
@@ -816,6 +907,7 @@ def push_account(
             "email": email,
             "method": "sso",
             "group_id": gid,
+            "proxy_id": proxy_id,
             "remote": {
                 "id": created.get("id"),
                 "name": created.get("name"),

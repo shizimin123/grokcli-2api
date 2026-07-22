@@ -2,21 +2,38 @@ package integrations
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
 type memStore struct {
-	auth map[string]any
-	cfg  map[string]any
+	auth     map[string]any
+	cfg      map[string]any
+	settings map[string]any
 }
 
 func (m *memStore) PublicSettings(ctx context.Context) (map[string]any, error) {
 	return map[string]any{"sub2api_config": redactIntegrationConfig("sub2api_config", m.cfg)}, nil
 }
-func (m *memStore) SetSetting(ctx context.Context, key string, value any) error { return nil }
+func (m *memStore) SetSetting(ctx context.Context, key string, value any) error {
+	if key == "sub2api_config" {
+		m.cfg, _ = value.(map[string]any)
+		return nil
+	}
+	if m.settings == nil {
+		m.settings = map[string]any{}
+	}
+	m.settings[key] = value
+	return nil
+}
 func (m *memStore) GetSetting(ctx context.Context, key string) (any, error) {
 	if key == "sub2api_config" {
 		return m.cfg, nil
+	}
+	if m.settings != nil {
+		return m.settings[key], nil
 	}
 	return nil, nil
 }
@@ -78,5 +95,65 @@ func TestPublicConfigRedactsPassword(t *testing.T) {
 	}
 	if out["has_password"] != true {
 		t.Fatalf("has_password missing: %#v", out)
+	}
+}
+
+func TestPushSub2APICreatesGroupAndMatchesProxy(t *testing.T) {
+	var createdGroup bool
+	var accountBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v1/auth/login":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"access_token":"jwt"}}`))
+		case r.URL.Path == "/api/v1/admin/groups" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`{"code":0,"data":[]}`))
+		case r.URL.Path == "/api/v1/admin/groups" && r.Method == http.MethodPost:
+			createdGroup = true
+			_, _ = w.Write([]byte(`{"code":0,"data":{"id":12,"name":"grokcli-2api"}}`))
+		case r.URL.Path == "/api/v1/admin/proxies":
+			_, _ = w.Write([]byte(`{"code":0,"data":[{"id":7,"protocol":"http","host":"192.0.2.10","port":7890}]}`))
+		case r.URL.Path == "/api/v1/admin/accounts" && r.Method == http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&accountBody); err != nil {
+				t.Errorf("decode account body: %v", err)
+			}
+			_, _ = w.Write([]byte(`{"code":0,"data":{"id":99,"name":"user@example.com"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	store := &memStore{
+		cfg: map[string]any{
+			"base_url":          server.URL,
+			"email":             "admin@example.com",
+			"password":          "secret",
+			"auto_create_group": true,
+		},
+		settings: map[string]any{
+			"registration_config": map[string]any{"proxy": "http://192.0.2.10:7890"},
+		},
+		auth: map[string]any{
+			"acc-1": map[string]any{"email": "user@example.com", "access_token": "token"},
+		},
+	}
+
+	result, err := PushSub2API(context.Background(), store, []string{"acc-1"}, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["ok"] != true {
+		t.Fatalf("result=%#v", result)
+	}
+	if !createdGroup {
+		t.Fatal("missing default group was not created")
+	}
+	if intField(accountBody, "proxy_id", 0) != 7 {
+		t.Fatalf("proxy_id=%v body=%#v", accountBody["proxy_id"], accountBody)
+	}
+	groups, _ := accountBody["group_ids"].([]any)
+	if len(groups) != 1 || int(groups[0].(float64)) != 12 {
+		t.Fatalf("group_ids=%#v", accountBody["group_ids"])
 	}
 }

@@ -74,6 +74,8 @@ def has_sso_value(entry: dict[str, Any] | None) -> bool:
 
 
 _DURABLE_ACCOUNT_FIELDS = (
+    "proxy",
+    "proxy_url",
     "sso",
     "sso_cookie",
     "sso_token",

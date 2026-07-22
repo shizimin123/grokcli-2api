@@ -3697,6 +3697,8 @@ def _run_registration(
             "source": "register-email",
             "registration_session_id": sid,
         }
+        if proxy:
+            import_payload["proxy"] = proxy
         if sess.get("batch_id"):
             import_payload["registration_batch_id"] = sess.get("batch_id")
         if sso_cookie:
