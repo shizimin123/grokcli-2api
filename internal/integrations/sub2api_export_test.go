@@ -113,6 +113,8 @@ func TestPushSub2APICreatesGroupAndMatchesProxy(t *testing.T) {
 			_, _ = w.Write([]byte(`{"code":0,"data":{"id":12,"name":"grokcli-2api"}}`))
 		case r.URL.Path == "/api/v1/admin/proxies":
 			_, _ = w.Write([]byte(`{"code":0,"data":[{"id":7,"protocol":"http","host":"192.0.2.10","port":7890}]}`))
+		case r.URL.Path == "/api/v1/admin/accounts" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`{"code":0,"data":{"items":[]}}`))
 		case r.URL.Path == "/api/v1/admin/accounts" && r.Method == http.MethodPost:
 			if err := json.NewDecoder(r.Body).Decode(&accountBody); err != nil {
 				t.Errorf("decode account body: %v", err)
@@ -155,5 +157,70 @@ func TestPushSub2APICreatesGroupAndMatchesProxy(t *testing.T) {
 	groups, _ := accountBody["group_ids"].([]any)
 	if len(groups) != 1 || int(groups[0].(float64)) != 12 {
 		t.Fatalf("group_ids=%#v", accountBody["group_ids"])
+	}
+}
+
+func TestPushSub2APIUpdatesFreshestAccountAndDeactivatesDuplicate(t *testing.T) {
+	var created bool
+	var canonicalBody map[string]any
+	var duplicateBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v1/auth/login":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"access_token":"jwt"}}`))
+		case r.URL.Path == "/api/v1/admin/accounts" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`{"code":0,"data":{"items":[{"id":20,"name":"user@example.com","platform":"grok","status":"active","credentials":{"expires_at":"2026-07-22T20:00:00Z"}},{"id":10,"name":"user@example.com","platform":"grok","status":"active","credentials":{"expires_at":"2026-07-22T18:00:00Z"}}]}}`))
+		case r.URL.Path == "/api/v1/admin/accounts" && r.Method == http.MethodPost:
+			created = true
+			http.Error(w, "unexpected create", http.StatusInternalServerError)
+		case r.URL.Path == "/api/v1/admin/accounts/20" && r.Method == http.MethodPut:
+			if err := json.NewDecoder(r.Body).Decode(&canonicalBody); err != nil {
+				t.Errorf("decode canonical body: %v", err)
+			}
+			_, _ = w.Write([]byte(`{"code":0,"data":{"id":20,"name":"user@example.com"}}`))
+		case r.URL.Path == "/api/v1/admin/accounts/10" && r.Method == http.MethodPut:
+			if err := json.NewDecoder(r.Body).Decode(&duplicateBody); err != nil {
+				t.Errorf("decode duplicate body: %v", err)
+			}
+			_, _ = w.Write([]byte(`{"code":0,"data":{"id":10,"name":"user@example.com"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	store := &memStore{
+		cfg: map[string]any{
+			"base_url": server.URL,
+			"email":    "admin@example.com",
+			"password": "secret",
+			"group_id": 12,
+			"proxy_id": 7,
+		},
+		auth: map[string]any{
+			"acc-1": map[string]any{
+				"email": "user@example.com", "access_token": "older-token",
+				"refresh_token": "older-refresh", "expires_at": "2026-07-22T19:00:00Z",
+			},
+		},
+	}
+
+	result, err := PushSub2API(context.Background(), store, []string{"acc-1"}, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["ok"] != true || created {
+		t.Fatalf("result=%#v created=%v", result, created)
+	}
+	if _, exists := canonicalBody["credentials"]; exists {
+		t.Fatalf("older credentials replaced fresher remote credentials: %#v", canonicalBody)
+	}
+	if duplicateBody["status"] != "inactive" {
+		t.Fatalf("duplicate body=%#v", duplicateBody)
+	}
+	rows, _ := result["results"].([]map[string]any)
+	if len(rows) != 1 || rows[0]["action"] != "updated" || intField(rows[0], "deduplicated", 0) != 1 {
+		t.Fatalf("results=%#v", result["results"])
 	}
 }

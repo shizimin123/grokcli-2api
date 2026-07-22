@@ -24,6 +24,8 @@ type Store interface {
 	ExportAuthMap(ctx context.Context, accountIDs []string, includeSecrets bool) (map[string]any, error)
 }
 
+var sub2UpsertLocks sync.Map
+
 func PublicConfig(ctx context.Context, store Store, key string) map[string]any {
 	out := map[string]any{"enabled": false, "base_url": ""}
 	if store == nil {
@@ -859,7 +861,7 @@ func pushOneSub2(ctx context.Context, client *http.Client, base, token string, g
 		"rate_multiplier": accRate,
 		"notes":           notesPrefix + ":" + aid,
 	}
-	created, err := sub2CreateAccount(ctx, client, base, token, body)
+	created, action, credentialsUpdated, deduplicated, err := sub2UpsertAccount(ctx, client, base, token, body)
 	if err != nil {
 		out["error"] = err.Error()
 		return out
@@ -868,6 +870,9 @@ func pushOneSub2(ctx context.Context, client *http.Client, base, token string, g
 	out["remote"] = map[string]any{"id": created["id"], "name": created["name"]}
 	out["group_id"] = gid
 	out["proxy_id"] = proxyValue
+	out["action"] = action
+	out["credentials_updated"] = credentialsUpdated
+	out["deduplicated"] = deduplicated
 	return out
 }
 
@@ -1026,8 +1031,12 @@ func sub2CreateGroup(ctx context.Context, base, token, name, platform string) (m
 }
 
 func sub2CreateAccount(ctx context.Context, client *http.Client, base, token string, body map[string]any) (map[string]any, error) {
+	return sub2WriteAccount(ctx, client, base, token, http.MethodPost, "/api/v1/admin/accounts", body)
+}
+
+func sub2WriteAccount(ctx context.Context, client *http.Client, base, token, method, path string, body map[string]any) (map[string]any, error) {
 	payload, _ := json.Marshal(body)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/v1/admin/accounts", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, method, base+path, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -1041,7 +1050,7 @@ func sub2CreateAccount(ctx context.Context, client *http.Client, base, token str
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("create status %d: %s", resp.StatusCode, string(raw))
+		return nil, fmt.Errorf("account write status %d: %s", resp.StatusCode, string(raw))
 	}
 	var parsed any
 	_ = json.Unmarshal(raw, &parsed)
@@ -1052,6 +1061,142 @@ func sub2CreateAccount(ctx context.Context, client *http.Client, base, token str
 		return m, nil
 	}
 	return map[string]any{"raw": string(raw)}, nil
+}
+
+func sub2ListAccountsByName(ctx context.Context, client *http.Client, base, token, name string) ([]map[string]any, error) {
+	query := url.Values{}
+	query.Set("platform", "grok")
+	query.Set("type", "oauth")
+	query.Set("search", name)
+	query.Set("page", "1")
+	query.Set("page_size", "100")
+	query.Set("sort_by", "created_at")
+	query.Set("sort_order", "desc")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/v1/admin/accounts?"+query.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "grokcli-2api-sub2api-push/1.0")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("list accounts status %d: %s", resp.StatusCode, string(raw))
+	}
+	var parsed any
+	_ = json.Unmarshal(raw, &parsed)
+	arr := digArray(parsed, "data.items", "data.accounts", "data.list", "items", "accounts")
+	out := []map[string]any{}
+	for _, item := range arr {
+		account, ok := item.(map[string]any)
+		if !ok || !strings.EqualFold(stringField(account, "platform"), "grok") || !strings.EqualFold(strings.TrimSpace(stringField(account, "name")), strings.TrimSpace(name)) {
+			continue
+		}
+		out = append(out, account)
+	}
+	return out, nil
+}
+
+func sub2AccountExpiry(account map[string]any) *float64 {
+	if credentials, ok := account["credentials"].(map[string]any); ok {
+		if exp := accounts.ParseExpiresAt(credentials["expires_at"], ""); exp != nil {
+			return exp
+		}
+	}
+	return accounts.ParseExpiresAt(account["expires_at"], "")
+}
+
+func sub2UpsertAccount(ctx context.Context, client *http.Client, base, token string, body map[string]any) (map[string]any, string, bool, int, error) {
+	name := stringField(body, "name")
+	lockKey := strings.ToLower(strings.TrimSpace(name))
+	lockValue, _ := sub2UpsertLocks.LoadOrStore(lockKey, &sync.Mutex{})
+	accountLock := lockValue.(*sync.Mutex)
+	accountLock.Lock()
+	defer accountLock.Unlock()
+	return sub2UpsertAccountLocked(ctx, client, base, token, body)
+}
+
+func sub2UpsertAccountLocked(ctx context.Context, client *http.Client, base, token string, body map[string]any) (map[string]any, string, bool, int, error) {
+	name := stringField(body, "name")
+	matches, err := sub2ListAccountsByName(ctx, client, base, token, name)
+	if err != nil {
+		return nil, "", false, 0, err
+	}
+	if len(matches) == 0 {
+		created, createErr := sub2CreateAccount(ctx, client, base, token, body)
+		return created, "created", true, 0, createErr
+	}
+
+	canonical := matches[0]
+	for _, candidate := range matches[1:] {
+		candidateExpiry := sub2AccountExpiry(candidate)
+		canonicalExpiry := sub2AccountExpiry(canonical)
+		candidateValue, canonicalValue := float64(0), float64(0)
+		if candidateExpiry != nil {
+			candidateValue = *candidateExpiry
+		}
+		if canonicalExpiry != nil {
+			canonicalValue = *canonicalExpiry
+		}
+		candidateActive := stringField(candidate, "status") == "active"
+		canonicalActive := stringField(canonical, "status") == "active"
+		if (candidateActive && !canonicalActive) || (candidateActive == canonicalActive && candidateValue > canonicalValue) || (candidateActive == canonicalActive && candidateValue == canonicalValue && intField(candidate, "id", 0) > intField(canonical, "id", 0)) {
+			canonical = candidate
+		}
+	}
+	canonicalID := intField(canonical, "id", 0)
+	if canonicalID <= 0 {
+		return nil, "", false, 0, fmt.Errorf("sub2api matched account has invalid id")
+	}
+
+	var incomingExpiry *float64
+	if credentials, ok := body["credentials"].(map[string]any); ok {
+		incomingExpiry = accounts.ParseExpiresAt(credentials["expires_at"], "")
+	}
+	remoteExpiry := sub2AccountExpiry(canonical)
+	credentialsUpdated := remoteExpiry == nil || (incomingExpiry != nil && *incomingExpiry > *remoteExpiry+1)
+	updateBody := map[string]any{}
+	for key, value := range body {
+		if key != "platform" && key != "extra" {
+			updateBody[key] = value
+		}
+	}
+	if !credentialsUpdated {
+		delete(updateBody, "credentials")
+	}
+	recoverError := stringField(canonical, "status") == "error" && credentialsUpdated
+	if stringField(canonical, "status") != "error" || recoverError {
+		updateBody["status"] = "active"
+	}
+	updated, err := sub2WriteAccount(ctx, client, base, token, http.MethodPut, fmt.Sprintf("/api/v1/admin/accounts/%d", canonicalID), updateBody)
+	if err != nil {
+		return nil, "", false, 0, err
+	}
+	if recoverError {
+		updated, err = sub2WriteAccount(ctx, client, base, token, http.MethodPost, fmt.Sprintf("/api/v1/admin/accounts/%d/clear-error", canonicalID), nil)
+		if err != nil {
+			return nil, "", false, 0, err
+		}
+	}
+
+	deduplicated := 0
+	for _, duplicate := range matches {
+		duplicateID := intField(duplicate, "id", 0)
+		if duplicateID <= 0 || duplicateID == canonicalID {
+			continue
+		}
+		if stringField(duplicate, "status") != "inactive" {
+			if _, err := sub2WriteAccount(ctx, client, base, token, http.MethodPut, fmt.Sprintf("/api/v1/admin/accounts/%d", duplicateID), map[string]any{"status": "inactive"}); err != nil {
+				return nil, "", false, deduplicated, err
+			}
+		}
+		deduplicated++
+	}
+	return updated, "updated", credentialsUpdated, deduplicated, nil
 }
 
 func sub2SSOToOAuth(ctx context.Context, client *http.Client, base, token string, ssoList []string, proxyID int) ([]map[string]any, error) {

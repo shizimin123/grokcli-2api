@@ -54,13 +54,109 @@ class Sub2APISyncTest(unittest.TestCase):
                 "list_proxies",
                 return_value=[{"id": 7, "protocol": "http", "host": "192.0.2.10", "port": 7890}],
             ),
-            patch.object(sub2, "create_grok_oauth_account", return_value={"id": 99}) as create,
+            patch.object(
+                sub2,
+                "upsert_grok_oauth_account",
+                return_value={
+                    "account": {"id": 99},
+                    "action": "created",
+                    "credentials_updated": True,
+                    "deduplicated": 0,
+                },
+            ) as upsert,
         ):
             result = sub2.push_account("acc-1", cfg=cfg)
         self.assertTrue(result["ok"])
         self.assertEqual(result["group_id"], 12)
         self.assertEqual(result["proxy_id"], 7)
-        self.assertEqual(create.call_args.kwargs["proxy_id"], 7)
+        self.assertEqual(upsert.call_args.kwargs["proxy_id"], 7)
+
+    def test_upsert_preserves_fresher_remote_and_deactivates_duplicate(self):
+        cfg = {"account_concurrency": 1}
+        matches = [
+            {
+                "id": 20,
+                "name": "user@example.com",
+                "platform": "grok",
+                "status": "active",
+                "credentials": {"expires_at": "2026-07-22T20:00:00Z"},
+            },
+            {
+                "id": 10,
+                "name": "user@example.com",
+                "platform": "grok",
+                "status": "active",
+                "credentials": {"expires_at": "2026-07-22T18:00:00Z"},
+            },
+        ]
+        with (
+            patch.object(sub2, "list_grok_accounts_by_name", return_value=matches),
+            patch.object(
+                sub2, "_write_grok_account", return_value={"id": 20}
+            ) as write,
+        ):
+            result = sub2.upsert_grok_oauth_account(
+                name="user@example.com",
+                group_id=12,
+                access_token="older-access",
+                refresh_token="older-refresh",
+                email="user@example.com",
+                expires_at="2026-07-22T19:00:00Z",
+                proxy_id=7,
+                cfg=cfg,
+            )
+
+        self.assertEqual(result["action"], "updated")
+        self.assertFalse(result["credentials_updated"])
+        self.assertEqual(result["deduplicated"], 1)
+        update_body = write.call_args_list[0].args[2]
+        self.assertNotIn("credentials", update_body)
+        self.assertEqual(write.call_args_list[0].args[1], "/api/v1/admin/accounts/20")
+        self.assertEqual(
+            write.call_args_list[1].args,
+            (
+                "PUT",
+                "/api/v1/admin/accounts/10",
+                {"status": "inactive"},
+                cfg,
+            ),
+        )
+
+    def test_upsert_recovers_error_only_with_newer_credentials(self):
+        cfg = {"account_concurrency": 1}
+        matches = [
+            {
+                "id": 30,
+                "name": "user@example.com",
+                "platform": "grok",
+                "status": "error",
+                "credentials": {"expires_at": "2026-07-22T18:00:00Z"},
+            }
+        ]
+        with (
+            patch.object(sub2, "list_grok_accounts_by_name", return_value=matches),
+            patch.object(
+                sub2, "_write_grok_account", return_value={"id": 30}
+            ) as write,
+        ):
+            result = sub2.upsert_grok_oauth_account(
+                name="user@example.com",
+                group_id=12,
+                access_token="new-access",
+                refresh_token="new-refresh",
+                email="user@example.com",
+                expires_at="2026-07-22T20:00:00Z",
+                proxy_id=7,
+                cfg=cfg,
+            )
+
+        self.assertTrue(result["credentials_updated"])
+        self.assertEqual(write.call_args_list[0].args[2]["status"], "active")
+        self.assertIn("credentials", write.call_args_list[0].args[2])
+        self.assertEqual(
+            write.call_args_list[1].args[1],
+            "/api/v1/admin/accounts/30/clear-error",
+        )
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ Config is stored under settings key ``sub2api_config``.
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -25,6 +26,8 @@ import grok2api.pool.accounts as accounts
 
 _DEFAULT_TIMEOUT = 45.0
 _USER_AGENT = "grokcli-2api-sub2api-push/1.0"
+_UPSERT_LOCKS_GUARD = threading.Lock()
+_UPSERT_LOCKS: dict[str, threading.Lock] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -697,7 +700,101 @@ def sso_to_oauth(
     return []
 
 
-def create_grok_oauth_account(
+def list_grok_accounts_by_name(
+    name: str,
+    cfg: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    target = str(name or "").strip()
+    if not target:
+        return []
+    query = urllib.parse.urlencode(
+        {
+            "platform": "grok",
+            "type": "oauth",
+            "search": target,
+            "page": 1,
+            "page_size": 100,
+            "sort_by": "created_at",
+            "sort_order": "desc",
+        }
+    )
+    status, parsed, raw = _request_authed(
+        "GET", f"/api/v1/admin/accounts?{query}", cfg=cfg
+    )
+    if status < 200 or status >= 300:
+        raise RuntimeError(_api_error_message(status, parsed, raw))
+    if isinstance(parsed, dict):
+        code = parsed.get("code")
+        if code not in (None, 0, "0", 200, "200"):
+            raise RuntimeError(_api_error_message(status, parsed, raw))
+    data = _unwrap_data(parsed)
+    items: Any = data
+    if isinstance(data, dict):
+        items = data.get("items") or data.get("accounts") or data.get("list") or []
+    if not isinstance(items, list):
+        return []
+    return [
+        item
+        for item in items
+        if isinstance(item, dict)
+        and str(item.get("platform") or "").lower() == "grok"
+        and str(item.get("name") or "").strip().lower() == target.lower()
+    ]
+
+
+def _expiry_timestamp(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number / 1000.0 if number > 10_000_000_000 else number
+    text = str(value).strip()
+    try:
+        number = float(text)
+        return number / 1000.0 if number > 10_000_000_000 else number
+    except ValueError:
+        pass
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _remote_account_expiry(account: dict[str, Any]) -> float | None:
+    credentials = account.get("credentials")
+    if isinstance(credentials, dict):
+        expiry = _expiry_timestamp(credentials.get("expires_at"))
+        if expiry is not None:
+            return expiry
+    return _expiry_timestamp(account.get("expires_at"))
+
+
+def _write_grok_account(
+    method: str,
+    path: str,
+    body: dict[str, Any] | None,
+    cfg: dict[str, Any] | None,
+) -> dict[str, Any]:
+    status, parsed, raw = _request_authed(
+        method,
+        path,
+        cfg=cfg,
+        body=body,
+        timeout=60,
+    )
+    if status < 200 or status >= 300:
+        raise RuntimeError(_api_error_message(status, parsed, raw))
+    if isinstance(parsed, dict):
+        code = parsed.get("code")
+        if code not in (None, 0, "0", 200, "200"):
+            raise RuntimeError(_api_error_message(status, parsed, raw))
+    data = _unwrap_data(parsed)
+    return data if isinstance(data, dict) else {"raw": parsed}
+
+
+def _build_grok_oauth_account_body(
     *,
     name: str,
     group_id: int,
@@ -724,7 +821,11 @@ def create_grok_oauth_account(
         acc_conc = 3
     acc_conc = max(1, min(100, acc_conc))
     try:
-        acc_prio = int(live_cfg.get("account_priority") if live_cfg.get("account_priority") is not None else 50)
+        acc_prio = int(
+            live_cfg.get("account_priority")
+            if live_cfg.get("account_priority") is not None
+            else 50
+        )
     except (TypeError, ValueError):
         acc_prio = 50
     acc_prio = max(0, min(100, acc_prio))
@@ -733,12 +834,12 @@ def create_grok_oauth_account(
     except (TypeError, ValueError):
         acc_rate = 1.0
     acc_rate = max(0.1, min(10.0, acc_rate))
-    body: dict[str, Any] = {
+    return {
         "name": name[:200] if name else (email or "grok-account")[:200],
         "platform": "grok",
         "type": "oauth",
         "credentials": credentials,
-        "extra": {},
+        "extra": {"email": email or "", "source": "grokcli-2api"},
         "proxy_id": proxy_id,
         "group_ids": [int(group_id)],
         "concurrency": acc_conc,
@@ -746,21 +847,144 @@ def create_grok_oauth_account(
         "rate_multiplier": acc_rate,
         "notes": notes or "",
     }
-    status, parsed, raw = _request_authed(
-        "POST",
-        "/api/v1/admin/accounts",
+
+
+def create_grok_oauth_account(
+    *,
+    name: str,
+    group_id: int,
+    access_token: str,
+    refresh_token: str = "",
+    email: str = "",
+    expires_at: str | None = None,
+    notes: str = "",
+    proxy_id: int | None = None,
+    cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    body = _build_grok_oauth_account_body(
+        name=name,
+        group_id=group_id,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        email=email,
+        expires_at=expires_at,
+        notes=notes,
+        proxy_id=proxy_id,
         cfg=cfg,
-        body=body,
-        timeout=60,
     )
-    if status < 200 or status >= 300:
-        raise RuntimeError(_api_error_message(status, parsed, raw))
-    if isinstance(parsed, dict):
-        code = parsed.get("code")
-        if code not in (None, 0, "0", 200, "200"):
-            raise RuntimeError(_api_error_message(status, parsed, raw))
-    data = _unwrap_data(parsed)
-    return data if isinstance(data, dict) else {"raw": parsed}
+    return _write_grok_account("POST", "/api/v1/admin/accounts", body, cfg)
+
+
+def upsert_grok_oauth_account(
+    *,
+    name: str,
+    group_id: int,
+    access_token: str,
+    refresh_token: str = "",
+    email: str = "",
+    expires_at: str | None = None,
+    notes: str = "",
+    proxy_id: int | None = None,
+    cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    body = _build_grok_oauth_account_body(
+        name=name,
+        group_id=group_id,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        email=email,
+        expires_at=expires_at,
+        notes=notes,
+        proxy_id=proxy_id,
+        cfg=cfg,
+    )
+    lock_key = str(body["name"]).strip().lower()
+    with _UPSERT_LOCKS_GUARD:
+        account_lock = _UPSERT_LOCKS.setdefault(lock_key, threading.Lock())
+    with account_lock:
+        return _upsert_grok_oauth_account_body(body, cfg)
+
+
+def _upsert_grok_oauth_account_body(
+    body: dict[str, Any],
+    cfg: dict[str, Any] | None,
+) -> dict[str, Any]:
+    matches = list_grok_accounts_by_name(body["name"], cfg)
+    if not matches:
+        created = _write_grok_account("POST", "/api/v1/admin/accounts", body, cfg)
+        return {
+            "account": created,
+            "action": "created",
+            "credentials_updated": True,
+            "deduplicated": 0,
+        }
+
+    def _rank(account: dict[str, Any]) -> tuple[int, float, int]:
+        expiry = _remote_account_expiry(account) or 0.0
+        active = 1 if str(account.get("status") or "") == "active" else 0
+        try:
+            account_id = int(account.get("id") or 0)
+        except (TypeError, ValueError):
+            account_id = 0
+        return active, expiry, account_id
+
+    canonical = max(matches, key=_rank)
+    canonical_id = int(canonical.get("id") or 0)
+    if canonical_id <= 0:
+        raise RuntimeError(f"sub2api matched account has invalid id: {canonical}")
+
+    incoming_credentials = body.get("credentials")
+    incoming_expiry = _expiry_timestamp(
+        incoming_credentials.get("expires_at")
+        if isinstance(incoming_credentials, dict)
+        else None
+    )
+    remote_expiry = _remote_account_expiry(canonical)
+    credentials_updated = remote_expiry is None or (
+        incoming_expiry is not None and incoming_expiry > remote_expiry + 1
+    )
+    update_body = dict(body)
+    update_body.pop("platform", None)
+    update_body.pop("extra", None)
+    if not credentials_updated:
+        update_body.pop("credentials", None)
+    recover_error = (
+        str(canonical.get("status") or "") == "error" and credentials_updated
+    )
+    if not recover_error and str(canonical.get("status") or "") == "error":
+        update_body.pop("status", None)
+    else:
+        update_body["status"] = "active"
+    updated = _write_grok_account(
+        "PUT", f"/api/v1/admin/accounts/{canonical_id}", update_body, cfg
+    )
+    if recover_error:
+        updated = _write_grok_account(
+            "POST", f"/api/v1/admin/accounts/{canonical_id}/clear-error", None, cfg
+        )
+
+    deduplicated = 0
+    for duplicate in matches:
+        try:
+            duplicate_id = int(duplicate.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if duplicate_id <= 0 or duplicate_id == canonical_id:
+            continue
+        if str(duplicate.get("status") or "") != "inactive":
+            _write_grok_account(
+                "PUT",
+                f"/api/v1/admin/accounts/{duplicate_id}",
+                {"status": "inactive"},
+                cfg,
+            )
+        deduplicated += 1
+    return {
+        "account": updated,
+        "action": "updated",
+        "credentials_updated": credentials_updated,
+        "deduplicated": deduplicated,
+    }
 
 
 def push_account(
@@ -795,7 +1019,7 @@ def push_account(
     # Path A: direct OAuth with local tokens
     if access:
         try:
-            created = create_grok_oauth_account(
+            upserted = upsert_grok_oauth_account(
                 name=name,
                 group_id=gid,
                 access_token=access,
@@ -806,6 +1030,7 @@ def push_account(
                 proxy_id=proxy_id,
                 cfg=cfg,
             )
+            remote = upserted.get("account") or {}
             return {
                 "ok": True,
                 "account_id": aid,
@@ -813,9 +1038,12 @@ def push_account(
                 "method": "oauth_token",
                 "group_id": gid,
                 "proxy_id": proxy_id,
+                "action": upserted.get("action"),
+                "credentials_updated": upserted.get("credentials_updated"),
+                "deduplicated": upserted.get("deduplicated", 0),
                 "remote": {
-                    "id": created.get("id"),
-                    "name": created.get("name"),
+                    "id": remote.get("id"),
+                    "name": remote.get("name"),
                 },
             }
         except Exception as e:  # noqa: BLE001
@@ -890,7 +1118,7 @@ def push_account(
     elif isinstance(exp2, (int, float)) and exp2 > 1_000_000_000:
         exp_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(exp2)))
     try:
-        created = create_grok_oauth_account(
+        upserted = upsert_grok_oauth_account(
             name=email or name,
             group_id=gid,
             access_token=access2,
@@ -901,6 +1129,7 @@ def push_account(
             proxy_id=proxy_id,
             cfg=cfg,
         )
+        remote = upserted.get("account") or {}
         return {
             "ok": True,
             "account_id": aid,
@@ -908,9 +1137,12 @@ def push_account(
             "method": "sso",
             "group_id": gid,
             "proxy_id": proxy_id,
+            "action": upserted.get("action"),
+            "credentials_updated": upserted.get("credentials_updated"),
+            "deduplicated": upserted.get("deduplicated", 0),
             "remote": {
-                "id": created.get("id"),
-                "name": created.get("name"),
+                "id": remote.get("id"),
+                "name": remote.get("name"),
             },
         }
     except Exception as e:  # noqa: BLE001
