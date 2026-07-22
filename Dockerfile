@@ -115,8 +115,8 @@ RUN python -m pip install --no-cache-dir --proxy http://10.0.0.10:7890 -U pip se
     && python -m pip install --no-cache-dir --proxy http://10.0.0.10:7890 -r /app/turnstile-solver-requirements.txt
 
 # Prefetch browser binaries used by inline solver
-RUN python -m camoufox fetch \
-    && python -m patchright install chromium || true
+RUN http_proxy=http://10.0.0.10:7890 https_proxy=http://10.0.0.10:7890 python -m camoufox fetch \
+    && http_proxy=http://10.0.0.10:7890 https_proxy=http://10.0.0.10:7890 python -m patchright install chromium || true
 
 COPY . /app
 COPY --from=go-builder /out/grok2api /app/bin/grok2api
