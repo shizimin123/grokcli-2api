@@ -98,6 +98,9 @@ cd grokcli-2api
 cp .env.example .env
 # 编辑 .env：至少改 GROK2API_ADMIN_PASSWORD；生产请改 Postgres 密码
 
+# 首次构建会下载浏览器等固定依赖；后续依赖未变化时直接复用 base 镜像
+./docker-build-base.sh
+# 受限网络可用：BUILD_HTTP_PROXY=http://proxy:port BUILD_HTTPS_PROXY=http://proxy:port ./docker-build-base.sh
 docker compose up -d --build
 curl -fsS http://127.0.0.1:3000/health
 ```
@@ -129,7 +132,7 @@ TURNSTILE_THREAD=3 GROK2API_REG_CONCURRENCY=3 docker compose up -d --build
 | `GROK2API_REG_WATCHDOG_SEC` | `45` | 运行中自愈扫描间隔 |
 | `GROK2API_SSO_DEVICE_RETRIES` | `6` | device-flow 限流重试次数 |
 | `TURNSTILE_THREAD` | `= REG_CONCURRENCY` | 本地过盾浏览器线程数 |
-| `TURNSTILE_BROWSER_TYPE` | `camoufox` | 过盾浏览器类型 |
+| `TURNSTILE_BROWSER_TYPE` | `camoufox` | 过盾浏览器类型；Camoufox 未安装时自动回退到内置 Chromium |
 | `TURNSTILE_PORT` | `5072` | 内联过盾监听端口（容器内 loopback） |
 
 > 2 核小机器建议 `TURNSTILE_THREAD=1~2`；`3` 已较重，`5` 容易把 CPU/内存打满。
@@ -502,7 +505,8 @@ docker exec grokcli-2api sh -c 'echo TZ=$TZ; date'
 
 - 仅 **leader** worker 跑 Token 续期与模型健康任务（Redis 选主）
 - 备份重点：**PostgreSQL 卷**（`grok2api_pg`）；Redis 可丢
-- 本地低停机重建：`./docker-rebuild.sh`
+- 本地低停机重建：`./docker-rebuild.sh`（自动检查并复用 `grokcli-2api-base:local`）
+- 仅依赖文件或 Dockerfile 的 base 段变化时才重建基础镜像；强制刷新可执行 `REBUILD_BASE=1 ./docker-build-base.sh`
 - Postgres / Redis **默认不暴露宿主机端口**
 - 任务日志表 `task_logs` 在 hybrid 启动时幂等创建
 - 默认时区 **Asia/Shanghai**（`TZ` / Dockerfile `tzdata`）
@@ -830,4 +834,3 @@ environment:
 | `GROK2API_GITHUB_TOKEN` | 提高 GitHub Release 检查限流额度 |
 
 兼容：若仍要宿主机 watcher，设置 `GROK2API_HOT_UPDATE_MODE=request_file` 并运行 `scripts/g2a-update-watcher.sh`。
-

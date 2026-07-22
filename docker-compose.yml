@@ -38,6 +38,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Built once by docker-build-base.sh; app rebuilds then skip foreign downloads.
+        GROK2API_BASE_IMAGE: "${GROK2API_BASE_IMAGE:-grokcli-2api-base:local}"
     image: grokcli-2api:local
     container_name: grokcli-2api
     env_file:

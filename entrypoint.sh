@@ -52,6 +52,12 @@ solver_host="${TURNSTILE_HOST:-127.0.0.1}"
 solver_pid=""
 reg_pid=""
 
+if [[ "${solver_browser}" == "camoufox" ]] \
+  && ! python -m camoufox version 2>/dev/null | grep -Eq 'Installed[[:space:]]+Yes'; then
+  echo "[entrypoint] WARN: Camoufox browser unavailable; falling back to bundled Chromium" >&2
+  solver_browser=chromium
+fi
+
 # Python package roots used by registration/SSO/captcha sidecars.
 export PYTHONPATH="${PYTHONPATH:-/app:/app/grok-build-auth}"
 case ":${PYTHONPATH}:" in

@@ -117,6 +117,7 @@ docker compose up -d
 # 或本地构建
 docker compose pull   # 若用 GHCR
 # 或
+./docker-build-base.sh
 docker compose build
 docker compose up -d
 curl -fsS http://127.0.0.1:3000/health || curl -fsS http://127.0.0.1:40081/health
