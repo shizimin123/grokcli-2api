@@ -190,7 +190,13 @@ async def list_mail_domains(request: Request) -> dict[str, Any]:
             note = "GPTMail GET /api/domains/public"
             base_out = mail.normalize_gptmail_base_url(base or None)
         elif prov == "cfmail":
-            domains = mail.cfmail_list_domains(api_key=key or None, base_url=base or None)
+            domains = mail.cfmail_list_domains(
+                api_key=key or None,
+                base_url=base or None,
+                proxy=str(body.get("proxy") or "").strip() or None,
+                proxy_username=str(body.get("proxy_username") or "").strip() or None,
+                proxy_password=str(body.get("proxy_password") or "").strip() or None,
+            )
             note = "CF Temp Email GET /open_api/settings"
             base_out = (base or mail.CFMAIL_DEFAULT_BASE_URL).rstrip("/")
         elif prov == "tempmail":

@@ -1237,8 +1237,15 @@ def cfmail_list_domains(
     api_key: str | None = None,
     base_url: str | None = None,
     site_password: str | None = None,
+    proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
 ) -> list[str]:
-    """List domains from CF Temp Email public settings (``GET /open_api/settings``)."""
+    """List domains from CF Temp Email public settings (``GET /open_api/settings``).
+
+    Uses the registration proxy when configured (important for Workers hosts
+    that are unreachable via direct egress from the server).
+    """
     base = normalize_cfmail_base_url(base_url or CFMAIL_DEFAULT_BASE_URL)
     # Prefer site password / admin password as x-custom-auth for private sites.
     headers = _cfmail_headers(
@@ -1247,7 +1254,12 @@ def cfmail_list_domains(
         content_type=False,
     )
     try:
-        with httpx.Client(timeout=20.0) as client:
+        with _httpx_client(
+            timeout=20.0,
+            proxy=proxy,
+            proxy_username=proxy_username,
+            proxy_password=proxy_password,
+        ) as client:
             resp = client.get(f"{base}/open_api/settings", headers=headers)
             if resp.status_code >= 400:
                 return []
@@ -1294,10 +1306,18 @@ def cfmail_pick_domain(
     api_key: str | None = None,
     base_url: str | None = None,
     site_password: str | None = None,
+    proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
 ) -> str | None:
     """Randomly pick a domain from CF Temp Email public settings."""
     domains = cfmail_list_domains(
-        api_key=api_key, base_url=base_url, site_password=site_password
+        api_key=api_key,
+        base_url=base_url,
+        site_password=site_password,
+        proxy=proxy,
+        proxy_username=proxy_username,
+        proxy_password=proxy_password,
     )
     if not domains:
         return None
@@ -1402,7 +1422,12 @@ def cfmail_create_mailbox(
         dom = (domain or "").strip().lstrip("@").strip(".")
     if not dom:
         dom = cfmail_pick_domain(
-            api_key=key, base_url=base, site_password=site_password
+            api_key=key,
+            base_url=base,
+            site_password=site_password,
+            proxy=proxy,
+            proxy_username=proxy_username,
+            proxy_password=proxy_password,
         ) or ""
     if not dom:
         raise ValueError(
@@ -1435,7 +1460,12 @@ def cfmail_create_mailbox(
     use_admin = "x-admin-auth" in headers
 
     last_err = ""
-    with httpx.Client(timeout=30.0) as client:
+    with _httpx_client(
+        timeout=30.0,
+        proxy=proxy,
+        proxy_username=proxy_username,
+        proxy_password=proxy_password,
+    ) as client:
         resp = None
         if use_admin:
             resp = client.post(
@@ -1499,7 +1529,12 @@ def cfmail_create_mailbox(
         # Some responses only return jwt + partial; try settings with jwt.
         if jwt:
             try:
-                with httpx.Client(timeout=20.0) as client:
+                with _httpx_client(
+                    timeout=20.0,
+                    proxy=proxy,
+                    proxy_username=proxy_username,
+                    proxy_password=proxy_password,
+                ) as client:
                     sresp = client.get(
                         f"{base}/api/settings",
                         headers=_cfmail_headers(api_key=str(jwt)),
@@ -1549,6 +1584,9 @@ def cfmail_fetch_messages(
     address: str | None = None,
     token: str | None = None,
     site_password: str | None = None,
+    proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
 ) -> list[dict[str, Any]]:
     """List messages for a CF Temp Email address JWT.
 
@@ -1569,7 +1607,12 @@ def cfmail_fetch_messages(
     base = normalize_cfmail_base_url(base_url or CFMAIL_DEFAULT_BASE_URL)
     headers = _cfmail_headers(api_key=jwt, site_password=site_password)
 
-    with httpx.Client(timeout=30.0) as client:
+    with _httpx_client(
+        timeout=30.0,
+        proxy=proxy,
+        proxy_username=proxy_username,
+        proxy_password=proxy_password,
+    ) as client:
         # 1) Parsed list (newer deploys)
         items: list[Any] = []
         used_parsed = False
@@ -2398,6 +2441,9 @@ def fetch_messages(
             include_details=include_details,
             address=address,
             token=token,
+            proxy=proxy,
+            proxy_username=proxy_username,
+            proxy_password=proxy_password,
         )
     if prov == "tempmail":
         return tempmail_fetch_messages(
