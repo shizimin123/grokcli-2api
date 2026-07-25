@@ -227,6 +227,7 @@ class YesCaptchaSolver:
         *,
         premium: bool = False,
         fallback_non_premium: bool = True,
+        proxy: str | None = None,
     ) -> str:
         """Solve a Cloudflare Turnstile challenge and return the token.
 
@@ -311,6 +312,10 @@ class YesCaptchaSolver:
                     "websiteURL": website_url,
                     "websiteKey": website_key,
                 }
+                if proxy:
+                    # The bundled local solver consumes this extension and creates
+                    # the browser context with the same proxy as registration.
+                    task["proxy"] = proxy
                 try:
                     self._progress(
                         f"solve_turnstile outer={outer}/{outer_rounds} "
