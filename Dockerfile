@@ -1,64 +1,23 @@
 # grokcli-2api — single container with optional inline Turnstile Solver
-FROM golang:1.24-bookworm AS go-builder
-
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY cmd ./cmd
-COPY internal ./internal
-RUN go build -o /out/grok2api ./cmd/grok2api \
-    && go build -o /out/grok2api-migrate ./cmd/grok2api-migrate
-
-FROM python:3.12-slim-bookworm
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    TZ=Asia/Shanghai \
-    GROK2API_HOST=0.0.0.0 \
-    GROK2API_PORT=3000 \
-    GROK2API_OPEN_BROWSER=0 \
-    GROK2API_STORE_BACKEND=hybrid \
-    GROK2API_RUNTIME=go \
-    GROK2API_GO_PUBLIC_READ=1 \
-    GROK2API_GO_CHAT=1 \
-    GROK2API_GO_MESSAGES=1 \
-    GROK2API_GO_RESPONSES=1 \
-    GROK2API_GO_ADMIN_READ=1 \
-    GROK2API_GO_ADMIN_WRITE=1 \
-    GROK2API_GO_MAINTAINER=1 \
-    GROK2API_GO_WRITES=1 \
-    GROK2API_GO_OWNERSHIP_MODE=all \
-    GROK2API_WORKERS=2 \
-    # App code + vendored registration protocol client
-    PYTHONPATH=/app:/app/grok-build-auth \
-    HOME=/root \
-    DEBIAN_FRONTEND=noninteractive \
-    # Inline local captcha defaults (same container, Python)
-    GROK2API_CAPTCHA_PROVIDER=local \
-    CAPTCHA_PROVIDER=local \
-    GROK2API_LOCAL_SOLVER_URL=http://127.0.0.1:5072 \
-    LOCAL_SOLVER_URL=http://127.0.0.1:5072 \
-    GROK2API_INLINE_SOLVER=1 \
-    TURNSTILE_HOST=127.0.0.1 \
-    TURNSTILE_PORT=5072 \
-    TURNSTILE_THREAD=3 \
-    TURNSTILE_BROWSER_TYPE=camoufox \
-    TURNSTILE_LAZY=1 \
-    TURNSTILE_IDLE_SEC=180 \
-    # Python registration/SSO sidecar (loopback only; used when RUNTIME=go)
-    GROK2API_REGISTRATION_SIDECAR=1 \
-    GROK2API_REGISTRATION_HOST=127.0.0.1 \
-    GROK2API_REGISTRATION_PORT=18070 \
-    GROK2API_REGISTRATION_SERVICE_URL=http://127.0.0.1:18070
-
-WORKDIR /app
+# Build the slow, stable dependency layer once with ./docker-build-base.sh.
+ARG GROK2API_BASE_IMAGE=runtime-base
+FROM python:3.12-slim-bookworm AS runtime-base
 
 # App tools + browser runtime libs for inline Turnstile Solver (Camoufox/Firefox)
 # Static docker CLI for in-container hot-update (needs docker.sock mount at runtime).
 ARG DOCKER_CLI_VERSION=27.5.1
 ARG TARGETARCH
-RUN apt-get update \
+ARG GROK2API_BASE_FINGERPRINT=development
+# Build-time proxy (optional, for restricted networks). Set via --build-arg when needed.
+ARG BUILD_HTTP_PROXY=""
+ARG BUILD_HTTPS_PROXY=""
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HOME=/root \
+    DEBIAN_FRONTEND=noninteractive
+WORKDIR /app
+RUN sed -i "s|deb.debian.org|mirrors.ustc.edu.cn|g" /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true && apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
@@ -97,7 +56,7 @@ RUN apt-get update \
          arm64|aarch64) darch=aarch64 ;; \
          *) darch=x86_64 ;; \
        esac \
-    && curl -fsSL "https://download.docker.com/linux/static/stable/${darch}/docker-${DOCKER_CLI_VERSION}.tgz" \
+    && curl -fsSL "https://mirrors.aliyun.com/docker-ce/linux/static/stable/${darch}/docker-${DOCKER_CLI_VERSION}.tgz" \
          | tar -xz -C /tmp \
     && mv /tmp/docker/docker /usr/local/bin/docker \
     && chmod +x /usr/local/bin/docker \
@@ -108,14 +67,71 @@ RUN apt-get update \
 COPY requirements.txt /app/requirements.txt
 COPY requirements-store.txt /app/requirements-store.txt
 COPY turnstile-solver/requirements.txt /app/turnstile-solver-requirements.txt
-RUN python -m pip install --no-cache-dir -U pip setuptools wheel \
-    && python -m pip install --no-cache-dir -r /app/requirements.txt \
-    && python -m pip install --no-cache-dir -r /app/requirements-store.txt \
-    && python -m pip install --no-cache-dir -r /app/turnstile-solver-requirements.txt
+RUN python -m pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -U pip setuptools wheel \
+    && python -m pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r /app/requirements.txt \
+    && python -m pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r /app/requirements-store.txt \
+    && python -m pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r /app/turnstile-solver-requirements.txt
 
-# Prefetch browser binaries used by inline solver
-RUN python -m camoufox fetch \
-    && python -m patchright install chromium || true
+# Prefer Camoufox, but always install Chromium as the reliable fallback.
+RUN (http_proxy=${BUILD_HTTP_PROXY} https_proxy=${BUILD_HTTPS_PROXY} python -m camoufox fetch \
+        || echo "WARN: Camoufox download failed; runtime will use Chromium") \
+    && http_proxy=${BUILD_HTTP_PROXY} https_proxy=${BUILD_HTTPS_PROXY} python -m patchright install chromium
+LABEL com.grokcli-2api.base.fingerprint=${GROK2API_BASE_FINGERPRINT}
+
+FROM golang:1.24-bookworm AS go-builder
+
+WORKDIR /src
+ENV GOPROXY=https://goproxy.cn,direct
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+RUN go build -o /out/grok2api ./cmd/grok2api \
+    && go build -o /out/grok2api-migrate ./cmd/grok2api-migrate
+
+# Compose points this at grokcli-2api-base:local. The default stage keeps
+# standalone/CI builds self-contained when no external base image is supplied.
+FROM ${GROK2API_BASE_IMAGE} AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TZ=Asia/Shanghai \
+    GROK2API_HOST=0.0.0.0 \
+    GROK2API_PORT=3000 \
+    GROK2API_OPEN_BROWSER=0 \
+    GROK2API_STORE_BACKEND=hybrid \
+    GROK2API_RUNTIME=go \
+    GROK2API_GO_PUBLIC_READ=1 \
+    GROK2API_GO_CHAT=1 \
+    GROK2API_GO_MESSAGES=1 \
+    GROK2API_GO_RESPONSES=1 \
+    GROK2API_GO_ADMIN_READ=1 \
+    GROK2API_GO_ADMIN_WRITE=1 \
+    GROK2API_GO_MAINTAINER=1 \
+    GROK2API_GO_WRITES=1 \
+    GROK2API_GO_OWNERSHIP_MODE=all \
+    GROK2API_WORKERS=2 \
+    PYTHONPATH=/app:/app/grok-build-auth \
+    HOME=/root \
+    DEBIAN_FRONTEND=noninteractive \
+    GROK2API_CAPTCHA_PROVIDER=local \
+    CAPTCHA_PROVIDER=local \
+    GROK2API_LOCAL_SOLVER_URL=http://127.0.0.1:5072 \
+    LOCAL_SOLVER_URL=http://127.0.0.1:5072 \
+    GROK2API_INLINE_SOLVER=1 \
+    TURNSTILE_HOST=127.0.0.1 \
+    TURNSTILE_PORT=5072 \
+    TURNSTILE_THREAD=3 \
+    TURNSTILE_BROWSER_TYPE=camoufox \
+    TURNSTILE_LAZY=1 \
+    TURNSTILE_IDLE_SEC=180 \
+    GROK2API_REGISTRATION_SIDECAR=1 \
+    GROK2API_REGISTRATION_HOST=127.0.0.1 \
+    GROK2API_REGISTRATION_PORT=18070 \
+    GROK2API_REGISTRATION_SERVICE_URL=http://127.0.0.1:18070
+
+WORKDIR /app
 
 COPY . /app
 COPY --from=go-builder /out/grok2api /app/bin/grok2api

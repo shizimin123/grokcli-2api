@@ -62,6 +62,10 @@ NO_CACHE="${NO_CACHE:-0}"
 echo "== admin assets =="
 python3 scripts/build_admin_assets.py || true
 
+echo "== runtime base image =="
+GROK2API_BASE_IMAGE="$(./docker-build-base.sh)"
+export GROK2API_BASE_IMAGE
+
 # Host bind-mounts ./bin over /app/bin (see docker-compose*.yml). Image rebuild alone
 # does NOT update the running Go binary — always compile into ./bin first.
 echo "== go binary (host ./bin bind-mount) =="
@@ -76,7 +80,7 @@ fi
 
 echo "== build (old container still serving) =="
 if [[ "$NO_CACHE" == "1" ]]; then
-  DOCKER_BUILDKIT=1 docker compose build --no-cache --pull "$APP_SERVICE"
+  DOCKER_BUILDKIT=1 docker compose build --no-cache "$APP_SERVICE"
 else
   DOCKER_BUILDKIT=1 docker compose build "$APP_SERVICE"
 fi
