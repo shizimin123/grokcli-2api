@@ -106,7 +106,7 @@ class XConsoleAuthClient:
         self,
         *,
         transport: str = "curl_cffi",
-        impersonate: str = "chrome131",
+        impersonate: str = "safari17_0",
         debug: bool = False,
         timeout: float = 30.0,
         proxy: Optional[str] = None,

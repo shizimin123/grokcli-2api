@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
 
 
 # Defaults that match the captured Chrome 148 / Windows profile.
-DEFAULT_IMPERSONATE = "chrome131"
+DEFAULT_IMPERSONATE = "safari17_0"
 DEFAULT_HTTP_VERSION = "v2"  # curl_cffi: "v2" or "v3" — accounts.x.ai serves HTTP/2
 DEFAULT_ACCEPT_ENCODING = "gzip, deflate, br, zstd"
 DEFAULT_JA3: Optional[str] = None  # let curl_cffi derive from impersonate target
