@@ -363,6 +363,11 @@ class XConsoleAuthClient:
             else:
                 rest.append(url)
         ordered = priority + rest
+        if not ordered:
+            raise RuntimeError(
+                "No /_next/static/chunks/*.js URLs found on sign-up page "
+                f"(html_len={len(html)}). Proxy/HTML may be blocked or challenged."
+            )
 
         # 3. fetch chunks in parallel and search for action hashes.
         # We collect ALL results and pick the best one (sign-up chunk > any).
@@ -390,7 +395,7 @@ class XConsoleAuthClient:
             except Exception:
                 return (None, False)
 
-        with ThreadPoolExecutor(max_workers=min(8, len(ordered))) as ex:
+        with ThreadPoolExecutor(max_workers=max(1, min(8, len(ordered)))) as ex:
             futures = {ex.submit(_fetch_and_search, url): url for url in ordered}
             for f in as_completed(futures):
                 h, is_signup = f.result()
